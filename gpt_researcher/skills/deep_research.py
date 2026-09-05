@@ -17,7 +17,6 @@ from ..utils.token_tracker import TokenTracker
 from ..utils.trajectory_logger import (
     TrajectoryLogger, FrontierNode, RoundCost, make_item_id,
 )
-from ..context import _global_embedding_cache
 from ..actions.query_processing import get_search_results
 
 logger = logging.getLogger(__name__)
@@ -413,7 +412,11 @@ Return ONLY a JSON object using this exact schema:
         if on_progress:
             on_progress(progress)
 
-        # Generate search queries
+        # Snapshot counters before any work so the round cost captures the full delta
+        tokens_before = TokenTracker.snapshot()
+        latency_counts_before = LatencyTracker.snapshot()
+        round_start = time.time()
+
         print(f"🔎 Generating {breadth} search queries...", flush=True)
         serp_queries = await self.generate_search_queries(query, num_queries=breadth)
         print(f"✅ Generated {len(serp_queries)} queries: {[q['query'] for q in serp_queries]}", flush=True)
@@ -526,10 +529,7 @@ Return ONLY a JSON object using this exact schema:
             }
 
         # -- Orchestration checkpoint: aggregate this layer's evidence --
-        tokens_before = TokenTracker.snapshot()
-        latency_counts_before = LatencyTracker.snapshot()
         round_id = self.trajectory_logger.begin_round()
-        round_start = time.time()
 
         new_item_ids: list[str] = []
         frontier_nodes: list[FrontierNode] = []
@@ -551,16 +551,12 @@ Return ONLY a JSON object using this exact schema:
             assert current_tree_depth >= 1, f"Invalid tree_depth={current_tree_depth} (self.depth={self.depth}, depth={depth})"
             for learning in result['learnings']:
                 source_url = result['citations'].get(learning, '')
-                cached_emb = _global_embedding_cache.doc_embeddings.get(
-                    _global_embedding_cache._chunk_id(learning, source_url)
-                )
                 item_id = self.trajectory_logger.add_evidence(
                     content=learning,
                     source_url=source_url,
                     source_subquery=result['researchGoal'],
                     tree_depth=current_tree_depth,
                     source_type="deep_research",
-                    embedding=cached_emb,
                 )
                 new_item_ids.append(item_id)
 
@@ -571,6 +567,24 @@ Return ONLY a JSON object using this exact schema:
                 parent_subquery=query[:200],
                 status="completed",
             ))
+
+        # Embed the learning strings directly for trajectory feature computation.
+        # Chunk embeddings from compression use different text; learnings are
+        # LLM-extracted insights and need their own embedding call.
+        try:
+            embeddings_model = self.researcher.memory.get_embeddings()
+            learning_texts = [
+                self.trajectory_logger._global_evidence[iid].content
+                for iid in new_item_ids
+                if iid in self.trajectory_logger._global_evidence
+            ]
+            if learning_texts:
+                vectors = await asyncio.to_thread(embeddings_model.embed_documents, learning_texts)
+                for iid, vec in zip(new_item_ids, vectors):
+                    if iid in self.trajectory_logger._global_evidence:
+                        self.trajectory_logger._global_evidence[iid].embedding = vec
+        except Exception as e:
+            logger.warning(f"Learning embedding failed (non-fatal): {e}")
 
         # Keep/prune decision: deduplicate learnings
         seen: set[str] = set()
