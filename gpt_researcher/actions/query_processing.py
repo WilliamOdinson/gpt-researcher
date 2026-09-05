@@ -123,6 +123,7 @@ async def generate_sub_queries(
             llm_kwargs=cfg.llm_kwargs,
             reasoning_effort=ReasoningEfforts.Medium.value,
             cost_callback=cost_callback,
+            usage_tag="subquery_generation",
             **kwargs
         )
     except Exception as e:
@@ -136,6 +137,7 @@ async def generate_sub_queries(
                 llm_provider=cfg.strategic_llm_provider,
                 llm_kwargs=cfg.llm_kwargs,
                 cost_callback=cost_callback,
+                usage_tag="subquery_generation",
                 **kwargs
             )
             logger.warning(f"Retrying with max_tokens={cfg.strategic_token_limit} successful.")
@@ -150,6 +152,7 @@ async def generate_sub_queries(
                 llm_provider=cfg.smart_llm_provider,
                 llm_kwargs=cfg.llm_kwargs,
                 cost_callback=cost_callback,
+                usage_tag="subquery_generation",
                 **kwargs
             )
 

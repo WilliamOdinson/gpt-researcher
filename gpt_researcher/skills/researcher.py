@@ -9,13 +9,17 @@ import asyncio
 import logging
 import os
 import random
+import time
 
 from ..actions.agent_creator import choose_agent
 from ..actions.query_processing import get_search_results, plan_research_outline
 from ..actions.utils import stream_output
 from ..document import DocumentLoader, LangChainDocumentLoader, OnlineDocumentLoader
 from ..utils.enum import ReportSource, ReportType
+from ..utils.latency_tracker import LatencyTracker
 from ..utils.logging_config import get_json_handler
+from ..utils.scraper_cache import _global_scraper_cache
+from ..utils.search_cache import _global_search_cache
 
 
 class ResearchConductor:
@@ -837,13 +841,21 @@ class ResearchConductor:
                 continue
 
             try:
-                # Instantiate the retriever with the sub-query
                 retriever = retriever_class(query, query_domains=query_domains)
 
-                # Perform the search using the current retriever
-                search_results = await asyncio.to_thread(
-                    retriever.search, max_results=self.researcher.cfg.max_search_results_per_query
-                )
+                cached = _global_search_cache.get(query, retriever_class.__name__)
+                if cached is not None:
+                    search_results = cached
+                    self.logger.info(f"Search cache hit for {retriever_class.__name__}: {query[:80]}")
+                else:
+                    start_time = time.time()
+                    search_results = await asyncio.to_thread(
+                        retriever.search, max_results=self.researcher.cfg.max_search_results_per_query
+                    )
+                    latency = time.time() - start_time
+                    LatencyTracker.track_latency("search", latency, source=retriever_class.__name__)
+                    if search_results:
+                        _global_search_cache.put(query, retriever_class.__name__, search_results)
 
                 if not search_results:
                     continue
@@ -923,10 +935,23 @@ class ResearchConductor:
                 self.researcher.websocket,
             )
 
-        # Scrape URLs that need fetching (skip those already provided by retrievers)
-        scraped_content = await self.researcher.scraper_manager.browse_urls(new_search_urls)
+        cached_content = []
+        urls_to_fetch = []
+        for url in new_search_urls:
+            cached = _global_scraper_cache.get(url)
+            if cached is not None:
+                cached_content.append(cached)
+            else:
+                urls_to_fetch.append(url)
 
-        # Merge pre-fetched content from retrievers that already provide full text
+        scraped_content = await self.researcher.scraper_manager.browse_urls(urls_to_fetch)
+
+        for item in scraped_content:
+            url = item.get("url") or item.get("source", "")
+            if url:
+                _global_scraper_cache.put(url, item)
+
+        scraped_content.extend(cached_content)
         scraped_content.extend(prefetched_content)
 
         if self.researcher.vector_store:

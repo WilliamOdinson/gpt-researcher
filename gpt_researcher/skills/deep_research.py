@@ -8,8 +8,15 @@ from datetime import datetime, timedelta
 import json_repair
 
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts
+from ..utils.latency_tracker import LatencyTracker
 from ..utils.llm import create_chat_completion
 from ..utils.enum import ReportType, ReportSource, Tone
+from ..utils.scraper_cache import _global_scraper_cache
+from ..utils.search_cache import _global_search_cache
+from ..utils.token_tracker import TokenTracker
+from ..utils.trajectory_logger import (
+    TrajectoryLogger, FrontierNode, RoundCost, make_item_id,
+)
 from ..actions.query_processing import get_search_results
 
 logger = logging.getLogger(__name__)
@@ -253,8 +260,9 @@ class DeepResearchSkill:
         self.headers = researcher.headers or {}
         self.visited_urls = researcher.visited_urls
         self.learnings = []
-        self.research_sources = []  # Track all research sources
-        self.context = []  # Track all context
+        self.research_sources = []
+        self.context = []
+        self.trajectory_logger = TrajectoryLogger(researcher.query)
 
     async def generate_search_queries(self, query: str, num_queries: int = 3) -> List[Dict[str, str]]:
         """Generate SERP queries for research"""
@@ -284,7 +292,8 @@ class DeepResearchSkill:
             model=self.researcher.cfg.strategic_llm_model,
             reasoning_effort=self.researcher.cfg.reasoning_effort,
             temperature=0.4,
-            llm_kwargs=self.researcher.cfg.llm_kwargs
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="deep_search_query_gen",
         )
 
         return parse_search_queries_response(response, num_queries)
@@ -338,7 +347,8 @@ Return ONLY a JSON object using this exact schema:
             model=self.researcher.cfg.strategic_llm_model,
             reasoning_effort=ReasoningEfforts.High.value,
             temperature=0.4,
-            llm_kwargs=self.researcher.cfg.llm_kwargs
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="deep_research_plan",
         )
 
         return parse_follow_up_questions_response(response, num_questions)
@@ -370,9 +380,9 @@ Return ONLY a JSON object using this exact schema:
             model=self.researcher.cfg.strategic_llm_model,
             temperature=0.4,
             reasoning_effort=ReasoningEfforts.High.value,
-            # Needs headroom for reasoning tokens on reasoning models
             max_tokens=4000,
-            llm_kwargs=self.researcher.cfg.llm_kwargs
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="deep_process_results",
         )
 
         return parse_research_results_response(response, num_learnings)
@@ -513,15 +523,19 @@ Return ONLY a JSON object using this exact schema:
                 'sources': all_sources,
             }
 
-        # Collect all results
+        # -- Orchestration checkpoint: aggregate this layer's evidence --
+        round_id = self.trajectory_logger.begin_round()
+        round_start = time.time()
+        round_search_calls = 0
+
+        new_item_ids: list[str] = []
+        frontier_nodes: list[FrontierNode] = []
+
         for result in results:
             all_learnings.extend(result['learnings'])
             all_visited_urls.update(result['visited_urls'])
             all_citations.update(result['citations'])
             if result['context']:
-                # Use extend, not append: when CURATE_SOURCES=True, result['context'] is
-                # a List[dict]. append() nests it as a single item, which causes
-                # "\n".join() to crash later with "expected str instance, dict found".
                 ctx = result['context']
                 if isinstance(ctx, list):
                     all_context.extend(ctx)
@@ -530,19 +544,83 @@ Return ONLY a JSON object using this exact schema:
             if result['sources']:
                 all_sources.extend(result['sources'])
 
-            # Continue deeper if needed
+            for learning in result['learnings']:
+                source_url = result['citations'].get(learning, '')
+                item_id = self.trajectory_logger.add_evidence(
+                    content=learning,
+                    source_url=source_url,
+                    source_subquery=result['researchGoal'],
+                    tree_depth=self.depth - depth + 1,
+                    source_type="deep_research",
+                )
+                new_item_ids.append(item_id)
+
+            node_id = make_item_id(result['researchGoal'], '')
+            frontier_nodes.append(FrontierNode(
+                node_id=node_id,
+                subquery=result['researchGoal'],
+                parent_subquery=query[:200],
+                status="completed",
+            ))
+
+        # Keep/prune decision: deduplicate learnings
+        seen: set[str] = set()
+        kept_ids: list[str] = []
+        pruned_ids: list[str] = []
+        deduped_learnings: list[str] = []
+        for learning in all_learnings:
+            iid = make_item_id(learning, all_citations.get(learning, ''))
+            if learning in seen:
+                pruned_ids.append(iid)
+            else:
+                seen.add(learning)
+                kept_ids.append(iid)
+                deduped_learnings.append(learning)
+        all_learnings = deduped_learnings
+
+        totals = TokenTracker.get_totals()
+        round_cost = RoundCost(
+            tokens_input=totals.get("input_tokens", 0),
+            tokens_output=totals.get("output_tokens", 0),
+            latency_seconds=time.time() - round_start,
+            llm_calls=len(results),
+            search_calls=round_search_calls,
+        )
+
+        has_deeper = depth > 1
+        self.trajectory_logger.record_round(
+            kept_item_ids=kept_ids,
+            pruned_item_ids=pruned_ids,
+            frontier=[
+                FrontierNode(
+                    node_id=fn.node_id,
+                    subquery=fn.subquery,
+                    parent_subquery=fn.parent_subquery,
+                    status="open" if has_deeper else "completed",
+                )
+                for fn in frontier_nodes
+            ],
+            round_cost=round_cost,
+            decision_type="continue" if has_deeper else "terminate",
+        )
+
+        logger.info(
+            f"Round {round_id} checkpoint: depth={depth}, "
+            f"kept={len(kept_ids)}, pruned={len(pruned_ids)}, "
+            f"frontier_nodes={len(frontier_nodes)}"
+        )
+
+        for result in results:
             if depth > 1:
                 new_breadth = max(2, breadth // 2)
                 new_depth = depth - 1
                 progress.current_depth += 1
 
-                # Create next query from research goal and follow-up questions
                 next_query = f"""
                 Previous research goal: {result['researchGoal']}
                 Follow-up questions: {' '.join(result['followUpQuestions'])}
                 """
 
-                # Recursive research
                 deeper_results = await self.deep_research(
                     query=next_query,
                     breadth=new_breadth,
@@ -561,16 +639,14 @@ Return ONLY a JSON object using this exact schema:
                 if deeper_results.get('sources'):
                     all_sources.extend(deeper_results['sources'])
 
-        # Update class tracking
         self.context.extend(all_context)
         self.research_sources.extend(all_sources)
 
-        # Trim context to stay within word limits
         trimmed_context = trim_context_to_word_limit(all_context)
         logger.info(f"Trimmed context from {len(all_context)} items to {len(trimmed_context)} items to stay within word limit")
 
         return {
-            'learnings': list(set(all_learnings)),
+            'learnings': all_learnings,
             'visited_urls': list(all_visited_urls),
             'citations': all_citations,
             'context': trimmed_context,
@@ -586,6 +662,7 @@ Return ONLY a JSON object using this exact schema:
         initial_costs = self.researcher.get_costs()
 
         follow_up_questions = await self.generate_research_plan(self.researcher.query)
+        self.trajectory_logger.set_subquestions(follow_up_questions)
         answers = ["Automatically proceeding with research"] * len(follow_up_questions)
 
         qa_pairs = [f"Q: {q}\nA: {a}" for q, a in zip(follow_up_questions, answers)]
@@ -639,11 +716,20 @@ Return ONLY a JSON object using this exact schema:
         if results.get('sources'):
             self.researcher.research_sources = results['sources']
 
-        # Log total execution time
+        # Finalize and save trajectory
+        token_totals = TokenTracker.get_totals()
+        token_totals["tool_calls"] = sum(
+            d.get("count", 0) for d in LatencyTracker.per_type_latencies.values()
+        )
+        self.trajectory_logger.finalize(self.researcher.context, token_totals)
+        trajectory_path = self.trajectory_logger.save()
+        _global_search_cache.save()
+        _global_scraper_cache.save()
+
         end_time = time.time()
         execution_time = timedelta(seconds=end_time - start_time)
         logger.info(f"Total research execution time: {execution_time}")
         logger.info(f"Total research costs: ${research_costs:.2f}")
+        logger.info(f"Trajectory saved to: {trajectory_path}")
 
-        # Return the context - don't generate report here as it will be done by the main agent
         return self.researcher.context
