@@ -17,6 +17,7 @@ from ..utils.token_tracker import TokenTracker
 from ..utils.trajectory_logger import (
     TrajectoryLogger, FrontierNode, RoundCost, make_item_id,
 )
+from ..context import _global_embedding_cache
 from ..actions.query_processing import get_search_results
 
 logger = logging.getLogger(__name__)
@@ -263,6 +264,7 @@ class DeepResearchSkill:
         self.research_sources = []
         self.context = []
         self.trajectory_logger = TrajectoryLogger(researcher.query)
+        logger.info(f"DeepResearchSkill initialized: depth={self.depth}, breadth={self.breadth}")
 
     async def generate_search_queries(self, query: str, num_queries: int = 3) -> List[Dict[str, str]]:
         """Generate SERP queries for research"""
@@ -524,9 +526,10 @@ Return ONLY a JSON object using this exact schema:
             }
 
         # -- Orchestration checkpoint: aggregate this layer's evidence --
+        tokens_before = TokenTracker.snapshot()
+        latency_counts_before = LatencyTracker.snapshot()
         round_id = self.trajectory_logger.begin_round()
         round_start = time.time()
-        round_search_calls = 0
 
         new_item_ids: list[str] = []
         frontier_nodes: list[FrontierNode] = []
@@ -544,14 +547,20 @@ Return ONLY a JSON object using this exact schema:
             if result['sources']:
                 all_sources.extend(result['sources'])
 
+            current_tree_depth = self.depth - depth + 1
+            assert current_tree_depth >= 1, f"Invalid tree_depth={current_tree_depth} (self.depth={self.depth}, depth={depth})"
             for learning in result['learnings']:
                 source_url = result['citations'].get(learning, '')
+                cached_emb = _global_embedding_cache.doc_embeddings.get(
+                    _global_embedding_cache._chunk_id(learning, source_url)
+                )
                 item_id = self.trajectory_logger.add_evidence(
                     content=learning,
                     source_url=source_url,
                     source_subquery=result['researchGoal'],
-                    tree_depth=self.depth - depth + 1,
+                    tree_depth=current_tree_depth,
                     source_type="deep_research",
+                    embedding=cached_emb,
                 )
                 new_item_ids.append(item_id)
 
@@ -578,12 +587,21 @@ Return ONLY a JSON object using this exact schema:
                 deduped_learnings.append(learning)
         all_learnings = deduped_learnings
 
-        totals = TokenTracker.get_totals()
+        tokens_after = TokenTracker.snapshot()
+        latency_counts_after = LatencyTracker.snapshot()
+        round_search_calls = (
+            latency_counts_after.get("search", 0)
+            - latency_counts_before.get("search", 0)
+        )
+        round_llm_calls = (
+            latency_counts_after.get("llm", 0)
+            - latency_counts_before.get("llm", 0)
+        )
         round_cost = RoundCost(
-            tokens_input=totals.get("input_tokens", 0),
-            tokens_output=totals.get("output_tokens", 0),
+            tokens_input=tokens_after["input_tokens"] - tokens_before["input_tokens"],
+            tokens_output=tokens_after["output_tokens"] - tokens_before["output_tokens"],
             latency_seconds=time.time() - round_start,
-            llm_calls=len(results),
+            llm_calls=round_llm_calls,
             search_calls=round_search_calls,
         )
 
@@ -658,7 +676,9 @@ Return ONLY a JSON object using this exact schema:
         print(f"\n🔍 DEEP RESEARCH: Starting with breadth={self.breadth}, depth={self.depth}, concurrency={self.concurrency_limit}", flush=True)
         start_time = time.time()
 
-        # Log initial costs
+        TokenTracker.reset()
+        LatencyTracker.reset()
+
         initial_costs = self.researcher.get_costs()
 
         follow_up_questions = await self.generate_research_plan(self.researcher.query)
@@ -716,12 +736,12 @@ Return ONLY a JSON object using this exact schema:
         if results.get('sources'):
             self.researcher.research_sources = results['sources']
 
-        # Finalize and save trajectory
         token_totals = TokenTracker.get_totals()
         token_totals["tool_calls"] = sum(
             d.get("count", 0) for d in LatencyTracker.per_type_latencies.values()
         )
-        self.trajectory_logger.finalize(self.researcher.context, token_totals)
+        final_ctx = self.researcher.context if isinstance(self.researcher.context, str) else str(self.researcher.context)
+        self.trajectory_logger.finalize(final_ctx, token_totals)
         trajectory_path = self.trajectory_logger.save()
         _global_search_cache.save()
         _global_scraper_cache.save()

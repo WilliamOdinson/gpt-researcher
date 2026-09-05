@@ -39,6 +39,15 @@ class TokenTracker:
         }
 
     @staticmethod
+    def snapshot() -> Dict[str, float | int]:
+        """Return a frozen copy of current totals for before/after diffing."""
+        return {
+            "input_tokens": TokenTracker.total_input_tokens,
+            "output_tokens": TokenTracker.total_output_tokens,
+            "cost": TokenTracker.total_cost,
+        }
+
+    @staticmethod
     def get_per_usage_totals() -> Dict[str, Dict[str, float | int]]:
         return TokenTracker.per_usage_totals
 

@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict
 
 
 class LatencyTracker:
@@ -25,6 +25,14 @@ class LatencyTracker:
             LatencyTracker.per_source_latencies[source]["count"] += 1
             LatencyTracker.per_source_latencies[source]["total_latency"] += latency
             LatencyTracker.per_source_latencies[source]["calls"].append(latency)
+
+    @staticmethod
+    def snapshot() -> Dict[str, int]:
+        """Return frozen per-type call counts for before/after diffing."""
+        return {
+            call_type: d.get("count", 0)
+            for call_type, d in LatencyTracker.per_type_latencies.items()
+        }
 
     @staticmethod
     def reset():

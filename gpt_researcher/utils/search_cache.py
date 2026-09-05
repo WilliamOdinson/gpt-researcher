@@ -8,13 +8,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(subquery: str, retriever_class_name: str) -> str:
-    raw = f"{retriever_class_name}:{subquery}"
+def _cache_key(subquery: str, retriever_class_name: str, max_results: int | None = None) -> str:
+    raw = f"{retriever_class_name}:{subquery}:max={max_results}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 class SearchResultCache:
-    """Caches retriever search results keyed by (subquery, retriever_class).
+    """Caches retriever search results keyed by (subquery, retriever_class, max_results).
 
     Stores the complete result dicts (url, title, snippet, raw_content)
     so they can be replayed for counterfactual trajectory forks.
@@ -27,12 +27,12 @@ class SearchResultCache:
             os.path.join(os.getcwd(), "trajectory_logs", "search_cache"),
         )
 
-    def get(self, subquery: str, retriever_class_name: str) -> list[dict[str, Any]] | None:
-        key = _cache_key(subquery, retriever_class_name)
+    def get(self, subquery: str, retriever_class_name: str, max_results: int | None = None) -> list[dict[str, Any]] | None:
+        key = _cache_key(subquery, retriever_class_name, max_results)
         return self._memory.get(key)
 
-    def put(self, subquery: str, retriever_class_name: str, results: list[dict[str, Any]]):
-        key = _cache_key(subquery, retriever_class_name)
+    def put(self, subquery: str, retriever_class_name: str, results: list[dict[str, Any]], max_results: int | None = None):
+        key = _cache_key(subquery, retriever_class_name, max_results)
         self._memory[key] = results
 
     def save(self) -> str:

@@ -189,6 +189,12 @@ class ContextCompressor:
         self.prompt_family = prompt_family
 
     def __get_contextual_retriever(self):
+        """Build the contextual compression retriever pipeline.
+
+        Returns:
+            A ContextualCompressionRetriever configured with text splitting
+            and embedding-based filtering.
+        """
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
         relevance_filter = EmbeddingsFilter(embeddings=self.embeddings,
                                             similarity_threshold=self.similarity_threshold)
@@ -204,6 +210,19 @@ class ContextCompressor:
         return contextual_retriever
 
     async def async_get_context(self, query: str, max_results: int = 5, cost_callback=None) -> str:
+        """Get relevant context from documents asynchronously.
+
+        Uses the standard langchain compression pipeline for filtering, then
+        populates the embedding cache with vectors for trajectory analysis.
+
+        Args:
+            query: The search query.
+            max_results: Maximum number of results to return.
+            cost_callback: Optional callback for tracking embedding costs.
+
+        Returns:
+            Formatted string of relevant document content.
+        """
         total_chars = sum(len(str(doc.get('raw_content', ''))) for doc in self.documents)
         chunk_threshold = int(os.environ.get("COMPRESSION_THRESHOLD", "8000"))
 
@@ -220,41 +239,35 @@ class ContextCompressor:
             ]
             return self.prompt_family.pretty_print_docs(direct_docs, max_results)
 
+        compressed_docs = self.__get_contextual_retriever()
         if cost_callback:
             cost_callback(estimate_embedding_cost(model=OPENAI_EMBEDDING_MODEL, docs=self.documents))
+        relevant_docs = await asyncio.to_thread(compressed_docs.invoke, query, **self.kwargs)
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        base_retriever = SearchAPIRetriever(pages=self.documents)
-        raw_docs = base_retriever.invoke(query, **self.kwargs)
-        all_chunks = splitter.transform_documents(raw_docs)
+        # Post-hoc: populate embedding cache for trajectory analysis.
+        # This re-embeds the chunks but does not change which chunks were kept;
+        # the original pipeline's filtering result is authoritative.
+        try:
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+            base_retriever = SearchAPIRetriever(pages=self.documents)
+            raw_docs = base_retriever.invoke(query, **self.kwargs)
+            all_chunks = splitter.transform_documents(raw_docs)
+            if all_chunks:
+                chunk_texts = [c.page_content for c in all_chunks]
+                chunk_embeddings = await asyncio.to_thread(self.embeddings.embed_documents, chunk_texts)
+                query_embedding = await asyncio.to_thread(self.embeddings.embed_query, query)
+                _global_embedding_cache.record(
+                    all_chunks=all_chunks,
+                    kept_chunks=relevant_docs,
+                    chunk_embeddings=chunk_embeddings,
+                    query_embedding=query_embedding,
+                    query=query,
+                    similarity_threshold=self.similarity_threshold,
+                )
+        except Exception as e:
+            _compression_logger.warning(f"Embedding cache population failed: {e}")
 
-        if not all_chunks:
-            return ""
-
-        chunk_texts = [c.page_content for c in all_chunks]
-        chunk_embeddings = await asyncio.to_thread(self.embeddings.embed_documents, chunk_texts)
-        query_embedding = await asyncio.to_thread(self.embeddings.embed_query, query)
-
-        q_vec = np.array(query_embedding)
-        q_norm = np.linalg.norm(q_vec)
-        kept_chunks = []
-        for chunk, emb in zip(all_chunks, chunk_embeddings):
-            d_vec = np.array(emb)
-            d_norm = np.linalg.norm(d_vec)
-            sim = float(np.dot(q_vec, d_vec) / (q_norm * d_norm)) if q_norm and d_norm else 0.0
-            if sim >= self.similarity_threshold:
-                kept_chunks.append(chunk)
-
-        _global_embedding_cache.record(
-            all_chunks=all_chunks,
-            kept_chunks=kept_chunks,
-            chunk_embeddings=chunk_embeddings,
-            query_embedding=query_embedding,
-            query=query,
-            similarity_threshold=self.similarity_threshold,
-        )
-
-        return self.prompt_family.pretty_print_docs(kept_chunks, max_results)
+        return self.prompt_family.pretty_print_docs(relevant_docs, max_results)
 
 
 class WrittenContentCompressor:

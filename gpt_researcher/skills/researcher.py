@@ -843,19 +843,20 @@ class ResearchConductor:
             try:
                 retriever = retriever_class(query, query_domains=query_domains)
 
-                cached = _global_search_cache.get(query, retriever_class.__name__)
+                _max_results = self.researcher.cfg.max_search_results_per_query
+                cached = _global_search_cache.get(query, retriever_class.__name__, _max_results)
                 if cached is not None:
                     search_results = cached
                     self.logger.info(f"Search cache hit for {retriever_class.__name__}: {query[:80]}")
                 else:
                     start_time = time.time()
                     search_results = await asyncio.to_thread(
-                        retriever.search, max_results=self.researcher.cfg.max_search_results_per_query
+                        retriever.search, max_results=_max_results
                     )
                     latency = time.time() - start_time
                     LatencyTracker.track_latency("search", latency, source=retriever_class.__name__)
                     if search_results:
-                        _global_search_cache.put(query, retriever_class.__name__, search_results)
+                        _global_search_cache.put(query, retriever_class.__name__, search_results, _max_results)
 
                 if not search_results:
                     continue

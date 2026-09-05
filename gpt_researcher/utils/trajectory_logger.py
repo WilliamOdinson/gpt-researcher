@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 class EvidenceItem:
     item_id: str
     content: str
-    token_length: int
+    word_count: int
     source_url: str
     source_subquery: str
     tree_depth: int
@@ -27,9 +28,13 @@ class EvidenceItem:
 
 @dataclass
 class RoundDecision:
-    type: str  # continue / prune / expand / terminate
+    # continue / prune / expand / terminate / reallocate
+    type: str
     kept_item_ids: list[str] = field(default_factory=list)
     pruned_item_ids: list[str] = field(default_factory=list)
+    # Maps subquery node_id to allocated breadth fraction.
+    # Currently empty because deep research uses fixed breadth // 2;
+    # populated when a learned orchestrator provides reallocation decisions.
     branch_allocation: dict[str, float] = field(default_factory=dict)
 
 
@@ -67,7 +72,7 @@ class Trajectory:
     subquestions: list[str] = field(default_factory=list)
     num_rounds: int = 0
     rounds: list[RoundSnapshot] = field(default_factory=list)
-    final_report: str = ""
+    final_context: str = ""
     total_tokens: int = 0
     total_latency: float = 0.0
     total_tool_calls: int = 0
@@ -121,11 +126,11 @@ class TrajectoryLogger:
         embedding: list[float] | None = None,
     ) -> str:
         item_id = make_item_id(content, source_url)
-        token_length = len(content.split())
+        word_count = len(content.split())
         item = EvidenceItem(
             item_id=item_id,
             content=content,
-            token_length=token_length,
+            word_count=word_count,
             source_url=source_url,
             source_subquery=source_subquery,
             tree_depth=tree_depth,
@@ -155,14 +160,14 @@ class TrajectoryLogger:
         snapshot = RoundSnapshot(
             round_id=self._round_counter,
             timestamp=time.time(),
-            evidence_pool=list(self._global_evidence.values()),
+            evidence_pool=copy.deepcopy(list(self._global_evidence.values())),
             decision=RoundDecision(
                 type=decision_type,
-                kept_item_ids=kept_item_ids,
-                pruned_item_ids=pruned_item_ids,
+                kept_item_ids=list(kept_item_ids),
+                pruned_item_ids=list(pruned_item_ids),
                 branch_allocation=branch_allocation or {},
             ),
-            frontier=frontier,
+            frontier=list(frontier),
             round_cost=round_cost,
         )
         self.trajectory.rounds.append(snapshot)
@@ -177,8 +182,8 @@ class TrajectoryLogger:
     def get_all_evidence(self) -> dict[str, EvidenceItem]:
         return dict(self._global_evidence)
 
-    def finalize(self, final_report: str, token_totals: dict[str, Any] | None = None):
-        self.trajectory.final_report = final_report
+    def finalize(self, final_context: str, token_totals: dict[str, Any] | None = None):
+        self.trajectory.final_context = final_context
         self.trajectory.num_rounds = self._round_counter
         self.trajectory.total_latency = time.time() - self._start_time
         self.trajectory.orchestration_steps = self._round_counter
@@ -196,7 +201,7 @@ class TrajectoryLogger:
             self.trajectory.total_tool_calls = token_totals.get("tool_calls", 0)
 
         self.trajectory.peak_context_length = max(
-            (sum(e.token_length for e in snap.evidence_pool) for snap in self.trajectory.rounds),
+            (sum(e.word_count for e in snap.evidence_pool) for snap in self.trajectory.rounds),
             default=0,
         )
 
@@ -207,19 +212,8 @@ class TrajectoryLogger:
         filename = f"trajectory_{self.trajectory.query_id}.json"
         path = out_dir / filename
 
-        data = _serialize(self.trajectory)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(asdict(self.trajectory), f, ensure_ascii=False, indent=2, default=str)
 
         logger.info(f"Trajectory saved to {path}")
         return str(path)
-
-
-def _serialize(obj: Any) -> Any:
-    if hasattr(obj, "__dataclass_fields__"):
-        return {k: _serialize(v) for k, v in asdict(obj).items()}
-    if isinstance(obj, list):
-        return [_serialize(v) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _serialize(v) for k, v in obj.items()}
-    return obj
