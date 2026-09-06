@@ -47,6 +47,7 @@ class _EmbeddingCache:
         self.last_kept_ids: list[str] = []
         self.last_pruned_ids: list[str] = []
         self.last_similarities: dict[str, float] = {}
+        self.records: list[dict] = []
 
     @staticmethod
     def _chunk_id(text: str, source: str = "") -> str:
@@ -88,10 +89,30 @@ class _EmbeddingCache:
         self.last_kept_ids = kept_ids
         self.last_pruned_ids = pruned_ids
 
+        self.records.append({
+            "query": query,
+            "chunks": [
+                {
+                    "chunk_id": self._chunk_id(c.page_content, c.metadata.get("source", "")),
+                    "content": c.page_content,
+                    "source_url": c.metadata.get("source", ""),
+                    "embedding": emb,
+                    "similarity": self.last_similarities[self._chunk_id(c.page_content, c.metadata.get("source", ""))],
+                    "kept": c.page_content in kept_contents,
+                }
+                for c, emb in zip(all_chunks, chunk_embeddings)
+            ],
+        })
+
         _compression_logger.info(
             f"Embedding cache: {len(kept_ids)} kept, {len(pruned_ids)} pruned "
             f"(threshold={similarity_threshold})"
         )
+
+    def drain(self) -> list[dict]:
+        out = self.records
+        self.records = []
+        return out
 
 
 _global_embedding_cache = _EmbeddingCache()

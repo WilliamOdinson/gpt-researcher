@@ -172,10 +172,6 @@ class TrajectoryLogger:
         )
         self.trajectory.rounds.append(snapshot)
 
-        if decision_type == "terminate":
-            for iid in pruned_item_ids:
-                self._global_evidence.pop(iid, None)
-
     def get_retained_evidence(self) -> dict[str, EvidenceItem]:
         return {k: v for k, v in self._global_evidence.items() if v.was_retained}
 
@@ -183,6 +179,11 @@ class TrajectoryLogger:
         return dict(self._global_evidence)
 
     def finalize(self, final_context: str, token_totals: dict[str, Any] | None = None):
+        if self.trajectory.rounds:
+            self.trajectory.rounds[-1].decision.type = "terminate"
+            for fn in self.trajectory.rounds[-1].frontier:
+                fn.status = "completed"
+
         self.trajectory.final_context = final_context
         self.trajectory.num_rounds = self._round_counter
         self.trajectory.total_latency = time.time() - self._start_time
@@ -199,11 +200,7 @@ class TrajectoryLogger:
         if token_totals:
             self.trajectory.total_tokens = token_totals.get("input_tokens", 0) + token_totals.get("output_tokens", 0)
             self.trajectory.total_tool_calls = token_totals.get("tool_calls", 0)
-
-        self.trajectory.peak_context_length = max(
-            (sum(e.word_count for e in snap.evidence_pool) for snap in self.trajectory.rounds),
-            default=0,
-        )
+            self.trajectory.peak_context_length = token_totals.get("peak_input_tokens", 0)
 
     def save(self) -> str:
         out_dir = Path(self._output_dir)
