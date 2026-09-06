@@ -3,9 +3,11 @@ import asyncio
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 import json_repair
+import numpy as np
 
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts
 from ..utils.latency_tracker import LatencyTracker
@@ -564,27 +566,40 @@ Return ONLY a JSON object using this exact schema:
                 status="open",
             ))
 
-        # Passage-level evidence from EmbeddingsFilter keep/prune decisions.
+        # Page-level evidence from EmbeddingsFilter keep/prune decisions.
         # Each sub-researcher's conduct_research -> compression pipeline populates
         # _global_embedding_cache.record(); drain() collects all chunks from this
-        # round's parallel queries.
+        # round's parallel queries. Chunks are aggregated by source URL into one
+        # evidence item per page: content is the deduplicated chunk text joined,
+        # embedding is the mean over all chunks, and the page is kept if any
+        # sub-query's filter kept any of its chunks.
         chunk_records = _global_embedding_cache.drain()
-        kept_ids: list[str] = []
-        pruned_ids: list[str] = []
+        pages: dict[str, dict] = defaultdict(
+            lambda: {"chunks": [], "embs": [], "kept": False, "subquery": None}
+        )
         for rec in chunk_records:
             for ch in rec["chunks"]:
-                item_id = self.trajectory_logger.add_evidence(
-                    content=ch["content"],
-                    source_url=ch["source_url"],
-                    source_subquery=rec["query"],
-                    tree_depth=current_tree_depth,
-                    source_type="passage",
-                    embedding=ch["embedding"],
-                )
-                if ch["kept"]:
-                    kept_ids.append(item_id)
-                else:
-                    pruned_ids.append(item_id)
+                p = pages[ch["source_url"]]
+                if p["subquery"] is None:
+                    p["subquery"] = rec["query"]
+                p["chunks"].append(ch["content"])
+                p["embs"].append(ch["embedding"])
+                p["kept"] = p["kept"] or ch["kept"]
+
+        kept_ids: list[str] = []
+        pruned_ids: list[str] = []
+        for url, p in pages.items():
+            seen: set[str] = set()
+            unique_chunks = [c for c in p["chunks"] if not (c in seen or seen.add(c))]
+            item_id = self.trajectory_logger.add_evidence(
+                content="\n\n".join(unique_chunks),
+                source_url=url,
+                source_subquery=p["subquery"],
+                tree_depth=current_tree_depth,
+                source_type="page",
+                embedding=np.mean(p["embs"], axis=0).tolist(),
+            )
+            (kept_ids if p["kept"] else pruned_ids).append(item_id)
 
         tokens_after = TokenTracker.snapshot()
         latency_counts_after = LatencyTracker.snapshot()
