@@ -5,6 +5,7 @@ autonomous research and report generation using LLMs and web search.
 """
 
 import asyncio
+import time
 import json
 import os
 from typing import Any, Optional
@@ -84,7 +85,7 @@ class GPTResearcher:
     ):
         """
         Initialize a GPT Researcher instance.
-        
+
         Args:
             query (str): The research query or question.
             report_type (str): Type of report to generate.
@@ -121,7 +122,7 @@ class GPTResearcher:
                 - connection_url (str): URL for WebSocket or HTTP connection
                 - connection_type (str): Connection type (stdio, websocket, http)
                 - connection_token (str): Authentication token for remote connections
-                
+
                 Example:
                 ```python
                 mcp_configs=[{
@@ -132,7 +133,7 @@ class GPTResearcher:
                 ```
             mcp_strategy (str, optional): MCP execution strategy. Options:
                 - "fast" (default): Run MCP once with original query for best performance
-                - "deep": Run MCP for all sub-queries for maximum thoroughness  
+                - "deep": Run MCP for all sub-queries for maximum thoroughness
                 - "disabled": Skip MCP entirely, use only web retrievers
         """
         self.kwargs = kwargs
@@ -167,17 +168,17 @@ class GPTResearcher:
         self._current_step: str = "general"
         self.log_handler = log_handler
         self.prompt_family = get_prompt_family(prompt_family or self.cfg.prompt_family, self.cfg)
-        
+
         # Process MCP configurations if provided
         self.mcp_configs = mcp_configs
         if mcp_configs:
             self._process_mcp_configs(mcp_configs)
-        
+
         self.retrievers = get_retrievers(self.headers, self.cfg)
         self.memory = Memory(
             self.cfg.embedding_provider, self.cfg.embedding_model, **self.cfg.embedding_kwargs
         )
-        
+
         # Set default encoding to utf-8
         self.encoding = kwargs.get('encoding', 'utf-8')
         self.kwargs.pop('encoding', None)  # Remove encoding from kwargs to avoid passing it to LLM calls
@@ -199,10 +200,10 @@ class GPTResearcher:
 
         # Handle MCP strategy configuration with backwards compatibility
         self.mcp_strategy = self._resolve_mcp_strategy(mcp_strategy, mcp_max_iterations)
-    
+
     def _generate_research_id(self) -> str:
         """Generate a unique research ID for this session.
-        
+
         Returns:
             A unique string identifier for this research session.
         """
@@ -217,17 +218,17 @@ class GPTResearcher:
     def _resolve_mcp_strategy(self, mcp_strategy: str | None, mcp_max_iterations: int | None) -> str:
         """
         Resolve MCP strategy from various sources with backwards compatibility.
-        
+
         Priority:
         1. Parameter mcp_strategy (new approach)
-        2. Parameter mcp_max_iterations (backwards compatibility)  
+        2. Parameter mcp_max_iterations (backwards compatibility)
         3. Config MCP_STRATEGY
         4. Default "fast"
-        
+
         Args:
             mcp_strategy: New strategy parameter
             mcp_max_iterations: Legacy parameter for backwards compatibility
-            
+
         Returns:
             str: Resolved strategy ("fast", "deep", or "disabled")
         """
@@ -249,12 +250,12 @@ class GPTResearcher:
                 import logging
                 logging.getLogger(__name__).warning(f"Invalid mcp_strategy '{mcp_strategy}', defaulting to 'fast'")
                 return "fast"
-        
+
         # Priority 2: Convert mcp_max_iterations for backwards compatibility
         if mcp_max_iterations is not None:
             import logging
             logging.getLogger(__name__).warning("mcp_max_iterations is deprecated, use mcp_strategy instead")
-            
+
             if mcp_max_iterations == 0:
                 return "disabled"
             elif mcp_max_iterations == 1:
@@ -264,7 +265,7 @@ class GPTResearcher:
             else:
                 # Treat any other number as fast mode
                 return "fast"
-        
+
         # Priority 3: Use config setting
         if hasattr(self.cfg, 'mcp_strategy'):
             config_strategy = self.cfg.mcp_strategy
@@ -276,7 +277,7 @@ class GPTResearcher:
                 return "fast"
             elif config_strategy == "comprehensive":
                 return "deep"
-            
+
         # Priority 4: Default to fast
         return "fast"
 
@@ -382,7 +383,7 @@ class GPTResearcher:
         await self._log_event("research", step="research_completed", details={
             "context_length": len(self.context)
         })
-        
+
         # Pre-generate images if enabled (happens BEFORE report writing for better UX)
         self.available_images = []
         if self.image_generator and self.image_generator.is_enabled():
@@ -397,7 +398,7 @@ class GPTResearcher:
             await self._log_event("research", step="images_pre_generated", details={
                 "images_count": len(self.available_images)
             })
-        
+
         return self.context
 
     async def _handle_deep_research(self, on_progress=None):
@@ -468,13 +469,23 @@ class GPTResearcher:
         """
         # Use pre-generated images if available (generated during conduct_research)
         has_available_images = bool(self.available_images)
-        
+
         self._current_step = "report_writing"
         await self._log_event("research", step="writing_report", details={
             "existing_headers": existing_headers,
             "context_source": "external" if ext_context else "internal",
             "available_images_count": len(self.available_images),
         })
+
+        # Snapshot trackers so deep-research trajectories can attribute
+        # synthesis cost separately from research rounds.
+        _traj = getattr(getattr(self, "deep_researcher", None), "trajectory_logger", None)
+        if _traj is not None:
+            from .utils.token_tracker import TokenTracker
+            from .utils.latency_tracker import LatencyTracker
+            _tok_before = TokenTracker.snapshot()
+            _lat_before = LatencyTracker.snapshot()
+            _t_before = time.time()
 
         # Generate report with available images embedded
         report = await self.report_generator.write_report(
@@ -484,6 +495,23 @@ class GPTResearcher:
             custom_prompt=custom_prompt,
             available_images=self.available_images,  # Pass pre-generated images
         )
+
+        if _traj is not None:
+            from .utils.trajectory_logger import RoundCost
+            _tok_after = TokenTracker.snapshot()
+            _lat_after = LatencyTracker.snapshot()
+            synthesis_cost = RoundCost(
+                tokens_input=_tok_after["input_tokens"] - _tok_before["input_tokens"],
+                tokens_output=_tok_after["output_tokens"] - _tok_before["output_tokens"],
+                latency_seconds=time.time() - _t_before,
+                llm_calls=_lat_after.get("llm", 0) - _lat_before.get("llm", 0),
+                search_calls=0,
+            )
+            totals = TokenTracker.get_totals()
+            totals["tool_calls"] = sum(
+                d.get("count", 0) for d in LatencyTracker.per_type_latencies.values()
+            )
+            _traj.record_report(report, synthesis_cost, totals)
 
         await self._log_event("research", step="report_completed", details={
             "report_length": len(report),

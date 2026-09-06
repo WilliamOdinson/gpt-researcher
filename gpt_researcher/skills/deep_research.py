@@ -3,16 +3,33 @@ import asyncio
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 import json_repair
+import numpy as np
 
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts
+from ..utils.latency_tracker import LatencyTracker
 from ..utils.llm import create_chat_completion
 from ..utils.enum import ReportType, ReportSource, Tone
+from ..utils.scraper_cache import _global_scraper_cache
+from ..utils.search_cache import _global_search_cache
+from ..utils.token_tracker import TokenTracker
+from ..utils.trajectory_logger import (
+    TrajectoryLogger, FrontierNode, RoundCost, make_item_id,
+)
+from ..context import _global_embedding_cache
 from ..actions.query_processing import get_search_results
 
 logger = logging.getLogger(__name__)
+
+
+def _unit_mean(vectors: list[list[float]]) -> list[float]:
+    """Mean of vectors, renormalized to unit length."""
+    m = np.mean(np.asarray(vectors, dtype=np.float32), axis=0)
+    n = np.linalg.norm(m)
+    return (m / n if n > 0 else m).tolist()
 
 # Maximum words allowed in context (25k words for safety margin)
 MAX_CONTEXT_WORDS = 25000
@@ -255,6 +272,8 @@ class DeepResearchSkill:
         self.learnings = []
         self.research_sources = []  # Track all research sources
         self.context = []  # Track all context
+        self.trajectory_logger = TrajectoryLogger(researcher.query)
+        logger.info(f"DeepResearchSkill initialized: depth={self.depth}, breadth={self.breadth}")
 
     async def generate_search_queries(self, query: str, num_queries: int = 3) -> List[Dict[str, str]]:
         """Generate SERP queries for research"""
@@ -284,7 +303,8 @@ class DeepResearchSkill:
             model=self.researcher.cfg.strategic_llm_model,
             reasoning_effort=self.researcher.cfg.reasoning_effort,
             temperature=0.4,
-            llm_kwargs=self.researcher.cfg.llm_kwargs
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="deep_search_query_gen",
         )
 
         return parse_search_queries_response(response, num_queries)
@@ -338,7 +358,8 @@ Return ONLY a JSON object using this exact schema:
             model=self.researcher.cfg.strategic_llm_model,
             reasoning_effort=ReasoningEfforts.High.value,
             temperature=0.4,
-            llm_kwargs=self.researcher.cfg.llm_kwargs
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="deep_research_plan",
         )
 
         return parse_follow_up_questions_response(response, num_questions)
@@ -369,10 +390,11 @@ Return ONLY a JSON object using this exact schema:
             llm_provider=self.researcher.cfg.strategic_llm_provider,
             model=self.researcher.cfg.strategic_llm_model,
             temperature=0.4,
-            reasoning_effort=ReasoningEfforts.High.value,
+            reasoning_effort=ReasoningEfforts.Low.value,
             # Needs headroom for reasoning tokens on reasoning models
-            max_tokens=4000,
-            llm_kwargs=self.researcher.cfg.llm_kwargs
+            max_tokens=16000,
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="deep_process_results",
         )
 
         return parse_research_results_response(response, num_learnings)
@@ -400,6 +422,11 @@ Return ONLY a JSON object using this exact schema:
 
         if on_progress:
             on_progress(progress)
+
+        # Snapshot counters before any work so the round cost captures the full delta
+        tokens_before = TokenTracker.snapshot()
+        latency_counts_before = LatencyTracker.snapshot()
+        round_start = time.time()
 
         # Generate search queries
         print(f"🔎 Generating {breadth} search queries...", flush=True)
@@ -513,6 +540,14 @@ Return ONLY a JSON object using this exact schema:
                 'sources': all_sources,
             }
 
+        # -- Orchestration checkpoint: aggregate this layer's evidence --
+        round_id = self.trajectory_logger.begin_round()
+
+        current_tree_depth = self.depth - depth + 1
+        assert current_tree_depth >= 1, f"Invalid tree_depth={current_tree_depth} (self.depth={self.depth}, depth={depth})"
+
+        frontier_nodes: list[FrontierNode] = []
+
         # Collect all results
         for result in results:
             all_learnings.extend(result['learnings'])
@@ -530,6 +565,82 @@ Return ONLY a JSON object using this exact schema:
             if result['sources']:
                 all_sources.extend(result['sources'])
 
+            node_id = make_item_id(result['researchGoal'], '')
+            frontier_nodes.append(FrontierNode(
+                node_id=node_id,
+                subquery=result['researchGoal'],
+                parent_subquery=query[:200],
+                status="open",
+            ))
+
+        # Page-level evidence from EmbeddingsFilter keep/prune decisions.
+        # Each sub-researcher's conduct_research -> compression pipeline populates
+        # _global_embedding_cache.record(); drain() collects all chunks from this
+        # round's parallel queries. Chunks are aggregated by source URL into one
+        # evidence item per page: content is the deduplicated chunk text joined,
+        # embedding is the mean over all chunks, and the page is kept if any
+        # sub-query's filter kept any of its chunks.
+        chunk_records = _global_embedding_cache.drain()
+        pages: dict[str, dict] = defaultdict(
+            lambda: {"chunks": [], "embs": [], "kept": False, "subquery": None}
+        )
+        for rec in chunk_records:
+            for ch in rec["chunks"]:
+                p = pages[ch["source_url"]]
+                if p["subquery"] is None:
+                    p["subquery"] = rec["query"]
+                p["chunks"].append(ch["content"])
+                p["embs"].append(ch["embedding"])
+                p["kept"] = p["kept"] or ch["kept"]
+
+        kept_ids: list[str] = []
+        pruned_ids: list[str] = []
+        for url, p in pages.items():
+            seen: set[str] = set()
+            unique_chunks = [c for c in p["chunks"] if not (c in seen or seen.add(c))]
+            item_id = self.trajectory_logger.add_evidence(
+                content="\n\n".join(unique_chunks),
+                source_url=url,
+                source_subquery=p["subquery"],
+                tree_depth=current_tree_depth,
+                source_type="page",
+                embedding=_unit_mean(p["embs"]),
+            )
+            (kept_ids if p["kept"] else pruned_ids).append(item_id)
+
+        tokens_after = TokenTracker.snapshot()
+        latency_counts_after = LatencyTracker.snapshot()
+        round_search_calls = (
+            latency_counts_after.get("search", 0)
+            - latency_counts_before.get("search", 0)
+        )
+        round_llm_calls = (
+            latency_counts_after.get("llm", 0)
+            - latency_counts_before.get("llm", 0)
+        )
+        round_cost = RoundCost(
+            tokens_input=tokens_after["input_tokens"] - tokens_before["input_tokens"],
+            tokens_output=tokens_after["output_tokens"] - tokens_before["output_tokens"],
+            latency_seconds=time.time() - round_start,
+            llm_calls=round_llm_calls,
+            search_calls=round_search_calls,
+        )
+
+        self.trajectory_logger.record_round(
+            kept_item_ids=kept_ids,
+            pruned_item_ids=pruned_ids,
+            frontier=frontier_nodes,
+            round_cost=round_cost,
+            decision_type="continue",
+        )
+
+        logger.info(
+            f"Round {round_id} checkpoint: depth={depth}, "
+            f"kept={len(kept_ids)}, pruned={len(pruned_ids)}, "
+            f"frontier_nodes={len(frontier_nodes)}"
+        )
+
+        for result in results:
             # Continue deeper if needed
             if depth > 1:
                 new_breadth = max(2, breadth // 2)
@@ -582,10 +693,14 @@ Return ONLY a JSON object using this exact schema:
         print(f"\n🔍 DEEP RESEARCH: Starting with breadth={self.breadth}, depth={self.depth}, concurrency={self.concurrency_limit}", flush=True)
         start_time = time.time()
 
+        TokenTracker.reset()
+        LatencyTracker.reset()
+
         # Log initial costs
         initial_costs = self.researcher.get_costs()
 
         follow_up_questions = await self.generate_research_plan(self.researcher.query)
+        self.trajectory_logger.set_subquestions(follow_up_questions)
         answers = ["Automatically proceeding with research"] * len(follow_up_questions)
 
         qa_pairs = [f"Q: {q}\nA: {a}" for q, a in zip(follow_up_questions, answers)]
@@ -625,7 +740,7 @@ Return ONLY a JSON object using this exact schema:
 
         # Trim final context to word limit
         final_context = trim_context_to_word_limit(context_with_citations)
-        
+
         # Set enhanced context and visited URLs
         self.researcher.context = "\n".join(
             item if isinstance(item, str)
@@ -639,11 +754,42 @@ Return ONLY a JSON object using this exact schema:
         if results.get('sources'):
             self.researcher.research_sources = results['sources']
 
+        # Auxiliary vectors for feature computation (rho_i, kappa_i, Phi):
+        # query, subquestions, and every frontier node subquery seen.
+        try:
+            emb_model = self.researcher.memory.get_embeddings()
+            node_ids: list[str] = []
+            node_texts: list[str] = []
+            for snap in self.trajectory_logger.trajectory.rounds:
+                for fn in snap.frontier:
+                    if fn.node_id not in node_ids:
+                        node_ids.append(fn.node_id)
+                        node_texts.append(fn.subquery)
+            subqs = list(self.trajectory_logger.trajectory.subquestions)
+            texts = [self.researcher.query] + subqs + node_texts
+            vecs = await asyncio.to_thread(emb_model.embed_documents, texts)
+            self.trajectory_logger.set_aux_vectors("query", [vecs[0]])
+            self.trajectory_logger.set_aux_vectors("subquestions", vecs[1:1 + len(subqs)])
+            self.trajectory_logger.set_aux_vectors("nodes", vecs[1 + len(subqs):], ids=node_ids)
+        except Exception as e:
+            logger.warning(f"Aux vector embedding failed (non-fatal): {e}")
+
+        token_totals = TokenTracker.get_totals()
+        token_totals["tool_calls"] = sum(
+            d.get("count", 0) for d in LatencyTracker.per_type_latencies.values()
+        )
+        final_ctx = self.researcher.context if isinstance(self.researcher.context, str) else str(self.researcher.context)
+        self.trajectory_logger.finalize(final_ctx, token_totals)
+        trajectory_path = self.trajectory_logger.save()
+        _global_search_cache.save()
+        _global_scraper_cache.save()
+
         # Log total execution time
         end_time = time.time()
         execution_time = timedelta(seconds=end_time - start_time)
         logger.info(f"Total research execution time: {execution_time}")
         logger.info(f"Total research costs: ${research_costs:.2f}")
+        logger.info(f"Trajectory saved to: {trajectory_path}")
 
         # Return the context - don't generate report here as it will be done by the main agent
         return self.researcher.context

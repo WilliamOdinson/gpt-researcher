@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 import asyncio
 
@@ -21,6 +22,8 @@ from gpt_researcher.llm_provider.generic.base import (
 
 from ..prompts import PromptFamily
 from .costs import calculate_llm_cost
+from .latency_tracker import LatencyTracker
+from .token_tracker import TokenTracker
 from .validators import Subtopics
 
 
@@ -49,6 +52,7 @@ async def create_chat_completion(
         llm_kwargs: dict[str, Any] | None = None,
         cost_callback: callable = None,
         reasoning_effort: str | None = ReasoningEfforts.Medium.value,
+        usage_tag: str | None = None,
         **kwargs
 ) -> str:
     """Create a chat completion using the OpenAI API
@@ -112,7 +116,7 @@ async def create_chat_completion(
 
     provider = get_llm(llm_provider, **provider_kwargs)
     response = ""
-    # create response
+    _llm_start = time.time()
     max_attempts = 1 if (stream and websocket is not None) else 10
     last_exception: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -140,17 +144,26 @@ async def create_chat_completion(
                 continue
             break
 
+        llm_costs = calculate_llm_cost(
+            llm_provider=llm_provider,
+            model=model,
+            input_content=str(messages),
+            output_content=response,
+            response_metadata=provider.last_response_metadata,
+            usage_metadata=provider.last_usage_metadata,
+            request_options=provider_kwargs,
+        )
         if cost_callback:
-            llm_costs = calculate_llm_cost(
-                llm_provider=llm_provider,
-                model=model,
-                input_content=str(messages),
-                output_content=response,
-                response_metadata=provider.last_response_metadata,
-                usage_metadata=provider.last_usage_metadata,
-                request_options=provider_kwargs,
-            )
             cost_callback(llm_costs)
+
+        _input_tokens = 0
+        _output_tokens = 0
+        usage_meta = provider.last_usage_metadata
+        if isinstance(usage_meta, dict):
+            _input_tokens = usage_meta.get("input_tokens", 0) or usage_meta.get("prompt_tokens", 0) or 0
+            _output_tokens = usage_meta.get("output_tokens", 0) or usage_meta.get("completion_tokens", 0) or 0
+        TokenTracker.track_tokens(model, _input_tokens, _output_tokens, llm_costs, usage_tag=usage_tag)
+        LatencyTracker.track_latency("llm", time.time() - _llm_start, source=model)
 
         return response
 

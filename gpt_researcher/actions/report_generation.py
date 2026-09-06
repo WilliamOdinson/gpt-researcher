@@ -52,6 +52,7 @@ async def write_report_introduction(
             max_tokens=config.smart_token_limit,
             llm_kwargs=config.llm_kwargs,
             cost_callback=cost_callback,
+            usage_tag="report_introduction",
             **kwargs
         )
         return introduction
@@ -104,6 +105,7 @@ async def write_conclusion(
             max_tokens=config.smart_token_limit,
             llm_kwargs=config.llm_kwargs,
             cost_callback=cost_callback,
+            usage_tag="report_conclusion",
             **kwargs
         )
         return conclusion
@@ -149,6 +151,7 @@ async def summarize_url(
             max_tokens=config.smart_token_limit,
             llm_kwargs=config.llm_kwargs,
             cost_callback=cost_callback,
+            usage_tag="url_summary",
             **kwargs
         )
         return summary
@@ -198,6 +201,7 @@ async def generate_draft_section_titles(
             max_tokens=config.smart_token_limit,
             llm_kwargs=config.llm_kwargs,
             cost_callback=cost_callback,
+            usage_tag="draft_titles",
             **kwargs
         )
         return section_titles.split("\n")
@@ -302,6 +306,7 @@ Place each image on its own line after the relevant section header or paragraph.
             max_tokens=cfg.smart_token_limit,
             llm_kwargs=cfg.llm_kwargs,
             cost_callback=cost_callback,
+            usage_tag="report_generation",
             **kwargs
         )
     except Exception:
@@ -318,6 +323,7 @@ Place each image on its own line after the relevant section header or paragraph.
                 max_tokens=cfg.smart_token_limit,
                 llm_kwargs=cfg.llm_kwargs,
                 cost_callback=cost_callback,
+                usage_tag="report_generation",
                 **kwargs
             )
         except Exception as e:
