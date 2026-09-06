@@ -381,7 +381,7 @@ Return ONLY a JSON object using this exact schema:
             model=self.researcher.cfg.strategic_llm_model,
             temperature=0.4,
             reasoning_effort=ReasoningEfforts.High.value,
-            max_tokens=4000,
+            max_tokens=16000,
             llm_kwargs=self.researcher.cfg.llm_kwargs,
             usage_tag="deep_process_results",
         )
