@@ -24,6 +24,13 @@ from ..actions.query_processing import get_search_results
 
 logger = logging.getLogger(__name__)
 
+
+def _unit_mean(vectors: list[list[float]]) -> list[float]:
+    """Mean of vectors, renormalized to unit length."""
+    m = np.mean(np.asarray(vectors, dtype=np.float32), axis=0)
+    n = np.linalg.norm(m)
+    return (m / n if n > 0 else m).tolist()
+
 # Maximum words allowed in context (25k words for safety margin)
 MAX_CONTEXT_WORDS = 25000
 
@@ -597,7 +604,7 @@ Return ONLY a JSON object using this exact schema:
                 source_subquery=p["subquery"],
                 tree_depth=current_tree_depth,
                 source_type="page",
-                embedding=np.mean(p["embs"], axis=0).tolist(),
+                embedding=_unit_mean(p["embs"]),
             )
             (kept_ids if p["kept"] else pruned_ids).append(item_id)
 
@@ -746,6 +753,26 @@ Return ONLY a JSON object using this exact schema:
         # Set research sources
         if results.get('sources'):
             self.researcher.research_sources = results['sources']
+
+        # Auxiliary vectors for feature computation (rho_i, kappa_i, Phi):
+        # query, subquestions, and every frontier node subquery seen.
+        try:
+            emb_model = self.researcher.memory.get_embeddings()
+            node_ids: list[str] = []
+            node_texts: list[str] = []
+            for snap in self.trajectory_logger.trajectory.rounds:
+                for fn in snap.frontier:
+                    if fn.node_id not in node_ids:
+                        node_ids.append(fn.node_id)
+                        node_texts.append(fn.subquery)
+            subqs = list(self.trajectory_logger.trajectory.subquestions)
+            texts = [self.researcher.query] + subqs + node_texts
+            vecs = await asyncio.to_thread(emb_model.embed_documents, texts)
+            self.trajectory_logger.set_aux_vectors("query", [vecs[0]])
+            self.trajectory_logger.set_aux_vectors("subquestions", vecs[1:1 + len(subqs)])
+            self.trajectory_logger.set_aux_vectors("nodes", vecs[1 + len(subqs):], ids=node_ids)
+        except Exception as e:
+            logger.warning(f"Aux vector embedding failed (non-fatal): {e}")
 
         token_totals = TokenTracker.get_totals()
         token_totals["tool_calls"] = sum(

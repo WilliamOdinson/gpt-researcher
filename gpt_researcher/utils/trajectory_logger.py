@@ -82,6 +82,10 @@ class Trajectory:
     # and written to trajectory_{query_id}_emb.npz instead.
     evidence: dict[str, EvidenceItem] = field(default_factory=dict)
     final_context: str = ""
+    # Final report from write_report(). Empty if only conduct_research() ran.
+    report: str = ""
+    # Cost of the write_report() call, separate from round costs.
+    synthesis_cost: RoundCost = field(default_factory=RoundCost)
     total_tokens: int = 0
     total_cost: float = 0.0
     total_latency: float = 0.0
@@ -113,6 +117,9 @@ class TrajectoryLogger:
         self._round_counter = 0
         self._current_round_start: float | None = None
         self._global_evidence: dict[str, EvidenceItem] = {}
+        # Vectors for query, subquestions and frontier nodes. Written to the
+        # npz alongside evidence vectors; never serialized into the JSON.
+        self._aux_vectors: dict[str, tuple[list[list[float]], list[str] | None]] = {}
         self._output_dir = output_dir or os.environ.get(
             "TRAJECTORY_OUTPUT_DIR",
             os.path.join(os.getcwd(), "trajectory_logs"),
@@ -202,6 +209,25 @@ class TrajectoryLogger:
     def get_all_evidence(self) -> dict[str, EvidenceItem]:
         return dict(self._global_evidence)
 
+    def set_aux_vectors(self, name: str, vectors: list[list[float]], ids: list[str] | None = None):
+        """Store auxiliary vectors for the npz under `name`; if `ids` is given,
+        they are written as `{name}_ids` so rows can be mapped back."""
+        self._aux_vectors[name] = (vectors, ids)
+
+    def record_report(self, report: str, synthesis_cost: RoundCost, token_totals: dict[str, Any] | None = None):
+        """Attach the final report and its cost, refresh totals, and re-save."""
+        self.trajectory.report = report
+        self.trajectory.synthesis_cost = synthesis_cost
+        if token_totals:
+            self.trajectory.total_tokens = (
+                token_totals.get("input_tokens", 0) + token_totals.get("output_tokens", 0)
+            )
+            self.trajectory.total_cost = float(token_totals.get("cost", 0.0))
+            self.trajectory.total_tool_calls = token_totals.get("tool_calls", 0)
+            self.trajectory.peak_context_length = token_totals.get("peak_input_tokens", 0)
+        self.trajectory.total_latency = time.time() - self._start_time
+        return self.save()
+
     def finalize(self, final_context: str, token_totals: dict[str, Any] | None = None):
         if self.trajectory.rounds:
             self.trajectory.rounds[-1].decision.type = "terminate"
@@ -237,20 +263,36 @@ class TrajectoryLogger:
         out_dir.mkdir(parents=True, exist_ok=True)
         qid = self.trajectory.query_id
 
+        def _unit(arr: np.ndarray) -> np.ndarray:
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr[None, :]
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            return arr / np.where(norms == 0, 1.0, norms)
+
         ids: list[str] = []
         vecs: list[list[float]] = []
         for iid, e in self.trajectory.evidence.items():
             if e.embedding is not None:
                 ids.append(iid)
                 vecs.append(e.embedding)
+
+        arrays: dict[str, np.ndarray] = {}
         if ids:
+            arrays["ids"] = np.array(ids)
+            arrays["vectors"] = _unit(vecs)
+        for name, (v, v_ids) in self._aux_vectors.items():
+            if v:
+                arrays[name] = _unit(v)
+                if v_ids:
+                    arrays[f"{name}_ids"] = np.array(v_ids)
+        if arrays:
             emb_path = out_dir / f"trajectory_{qid}_emb.npz"
-            np.savez_compressed(
-                emb_path,
-                ids=np.array(ids),
-                vectors=np.array(vecs, dtype=np.float32),
+            np.savez_compressed(emb_path, **arrays)
+            logger.info(
+                f"Embeddings saved to {emb_path} "
+                f"({len(ids)} evidence, aux={list(self._aux_vectors)})"
             )
-            logger.info(f"Embeddings saved to {emb_path} ({len(ids)} vectors)")
 
         data = asdict(self.trajectory)
         for e in data["evidence"].values():
