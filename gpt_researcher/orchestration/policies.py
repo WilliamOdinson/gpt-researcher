@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -357,7 +358,12 @@ class LLMLinguaPolicy(OrchestrationPolicy):
                     "GR_ORCHESTRATOR=llmlingua needs the llmlingua package: "
                     "pip install llmlingua (downloads a ~500MB model on first use)"
                 ) from exc
-            self._compressor = PromptCompressor(model_name=self.model_name, use_llmlingua2=True)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._compressor = PromptCompressor(
+                model_name=self.model_name,
+                use_llmlingua2=True,
+                device_map=device,
+            )
         return self._compressor
 
     def _compress_one(self, text: str, rate: float) -> str:
