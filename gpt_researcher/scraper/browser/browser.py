@@ -120,7 +120,12 @@ class BrowserScraper:
                     options.add_argument("--disable-dev-shm-usage")
                     options.add_argument("--remote-debugging-port=9222")
                 options.add_argument("--no-sandbox")
-                options.add_experimental_option("prefs", {"download_restrictions": 3})
+                options.add_argument("--disable-notifications")
+                options.add_argument("--disable-popup-blocking")
+                options.add_experimental_option("prefs", {
+                    "download_restrictions": 3,
+                    "profile.default_content_setting_values.notifications": 2,
+                })
                 self.driver = webdriver.Chrome(options=options)
 
             if self.use_browser_cookies:
@@ -214,6 +219,20 @@ class BrowserScraper:
             print("Timed out waiting for page to load")
             print(f"Full stack trace:\n{traceback.format_exc()}")
             return "Page load timed out", [], ""
+
+        try:
+            self.driver.execute_script("""
+                document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"], [class*="consent"], [class*="subscribe"], [class*="newsletter"], [class*="notification"], [id*="modal"], [id*="popup"], [id*="overlay"], [id*="consent"]').forEach(el => el.remove());
+                document.querySelectorAll('*').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.position === 'fixed' && parseInt(style.zIndex) > 999) el.remove();
+                });
+                document.querySelectorAll('[class*="close"], [class*="dismiss"], [class*="accept"], [aria-label="Close"]').forEach(btn => {
+                    try { btn.click(); } catch(e) {}
+                });
+            """)
+        except Exception:
+            pass
 
         self._scroll_to_bottom()
 
