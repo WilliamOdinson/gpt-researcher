@@ -127,6 +127,7 @@ class BrowserScraper:
                     "profile.default_content_setting_values.notifications": 2,
                 })
                 self.driver = webdriver.Chrome(options=options)
+                self.driver.set_page_load_timeout(15)
 
             if self.use_browser_cookies:
                 self._load_browser_cookies()
@@ -212,7 +213,7 @@ class BrowserScraper:
         self.driver.get(self.url)
 
         try:
-            WebDriverWait(self.driver, 20).until(
+            WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
         except TimeoutException as e:
@@ -234,7 +235,10 @@ class BrowserScraper:
         except Exception:
             pass
 
-        self._scroll_to_bottom()
+        try:
+            self._scroll_to_bottom()
+        except Exception:
+            pass
 
         if _is_pdf_url(self.url):
             text = scrape_pdf_with_pymupdf(self.url)
