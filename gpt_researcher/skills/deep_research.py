@@ -303,6 +303,7 @@ class DeepResearchSkill:
             model=self.researcher.cfg.strategic_llm_model,
             reasoning_effort=self.researcher.cfg.reasoning_effort,
             temperature=0.4,
+            max_tokens=4000,
             llm_kwargs=self.researcher.cfg.llm_kwargs,
             usage_tag="deep_search_query_gen",
         )
@@ -428,7 +429,12 @@ Return ONLY a JSON object using this exact schema:
         latency_counts_before = LatencyTracker.snapshot()
         round_start = time.time()
 
-        # Generate search queries
+        all_learnings = learnings.copy()
+        all_visited_urls = set(visited_urls) if visited_urls else set()
+        all_citations = dict(citations) if citations else {}
+        all_context = []
+        all_sources = []
+
         print(f"🔎 Generating {breadth} search queries...", flush=True)
         serp_queries = await self.generate_search_queries(query, num_queries=breadth)
         print(f"✅ Generated {len(serp_queries)} queries: {[q['query'] for q in serp_queries]}", flush=True)
@@ -442,12 +448,6 @@ Return ONLY a JSON object using this exact schema:
                 'context': all_context,
                 'sources': all_sources,
             }
-
-        all_learnings = learnings.copy()
-        all_citations = citations.copy()
-        all_visited_urls = visited_urls.copy()
-        all_context = []
-        all_sources = []
 
         # Process queries with concurrency limit
         semaphore = asyncio.Semaphore(self.concurrency_limit)
