@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional, Set
 import asyncio
 import logging
+import os
 import re
 import time
 from collections import defaultdict
@@ -21,6 +22,16 @@ from ..utils.trajectory_logger import (
 )
 from ..context import _global_embedding_cache
 from ..actions.query_processing import get_search_results
+from ..orchestration import (
+    ENV_BUDGET_NAME,
+    FrontierInfo,
+    OrchestrationInput,
+    PoolItem,
+    allocate_breadth,
+    build_policy,
+    estimate_tokens,
+    policy_name_from_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +284,62 @@ class DeepResearchSkill:
         self.research_sources = []  # Track all research sources
         self.context = []  # Track all context
         self.trajectory_logger = TrajectoryLogger(researcher.query)
-        logger.info(f"DeepResearchSkill initialized: depth={self.depth}, breadth={self.breadth}")
+
+        # Orchestration policy (GR_ORCHESTRATOR). ``None`` means legacy: the
+        # checkpoint only records what the per-sub-query EmbeddingsFilter kept
+        # and the recursion is fixed. Any other value makes the checkpoint act
+        # on the policy's (u, m, w).
+        self.policy_name = policy_name_from_env()
+        self.orchestrator = build_policy(self.policy_name, llm_call=self._orchestrator_llm_call)
+        raw_budget = os.environ.get(ENV_BUDGET_NAME, "").strip()
+        self.token_budget: int | None = int(raw_budget) if raw_budget else None
+        self.query_embedding: list[float] | None = None
+        self.subq_embeddings: list[list[float]] = []
+        # Set when a policy returns u=terminate; every pending recursion stops.
+        self.stop_requested = False
+        logger.info(
+            f"DeepResearchSkill initialized: depth={self.depth}, breadth={self.breadth}, "
+            f"orchestrator={self.policy_name}, context_budget={self.token_budget}"
+        )
+
+    async def _orchestrator_llm_call(self, messages: List[Dict[str, str]]) -> str:
+        """LLM call used by the prompted policy; metered like every other call."""
+        return await create_chat_completion(
+            messages=messages,
+            llm_provider=self.researcher.cfg.strategic_llm_provider,
+            model=self.researcher.cfg.strategic_llm_model,
+            temperature=0.0,
+            max_tokens=2000,
+            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            usage_tag="orchestrator",
+        )
+
+    @staticmethod
+    def _format_item(source_url: str, text: str) -> str:
+        """Context line for one retained page; keeps the URL so the report can cite it."""
+        return f"Source: {source_url}\nContent: {text}\n"
+
+    def _retained_context(self) -> List[str]:
+        """The authoritative K_T: every retained item's (possibly compressed)
+        text, in retrieval order. Used for the final synthesis context when an
+        orchestration policy is active."""
+        items = sorted(
+            self.trajectory_logger.get_retained_evidence().values(),
+            key=lambda e: (e.retrieval_round, e.tree_depth),
+        )
+        return [self._format_item(e.source_url, e.content) for e in items]
+
+    async def _embed_query_and_subquestions(self, subquestions: List[str]) -> None:
+        """Embed the root query and sub-questions once so policies can score
+        evidence against them. Non-fatal: policies degrade to score 0."""
+        try:
+            emb_model = self.researcher.memory.get_embeddings()
+            texts = [self.researcher.query] + list(subquestions)
+            vecs = await asyncio.to_thread(emb_model.embed_documents, texts)
+            self.query_embedding = list(vecs[0])
+            self.subq_embeddings = [list(v) for v in vecs[1:]]
+        except Exception as e:
+            logger.warning(f"Query embedding for orchestrator failed (non-fatal): {e}")
 
     async def generate_search_queries(self, query: str, num_queries: int = 3) -> List[Dict[str, str]]:
         """Generate SERP queries for research"""
@@ -593,20 +659,128 @@ Return ONLY a JSON object using this exact schema:
                 p["embs"].append(ch["embedding"])
                 p["kept"] = p["kept"] or ch["kept"]
 
-        kept_ids: list[str] = []
-        pruned_ids: list[str] = []
+        # One evidence item per page. Chunks are deduplicated with their
+        # embeddings kept aligned so policies can score at chunk granularity.
+        page_items: list[dict] = []
         for url, p in pages.items():
             seen: set[str] = set()
-            unique_chunks = [c for c in p["chunks"] if not (c in seen or seen.add(c))]
+            unique_chunks: list[str] = []
+            unique_embs: list[list[float]] = []
+            for chunk, emb in zip(p["chunks"], p["embs"]):
+                if chunk in seen:
+                    continue
+                seen.add(chunk)
+                unique_chunks.append(chunk)
+                unique_embs.append(emb)
+            content = "\n\n".join(unique_chunks)
             item_id = self.trajectory_logger.add_evidence(
-                content="\n\n".join(unique_chunks),
+                content=content,
                 source_url=url,
                 source_subquery=p["subquery"],
                 tree_depth=current_tree_depth,
                 source_type="page",
-                embedding=_unit_mean(p["embs"]),
+                embedding=_unit_mean(unique_embs) if unique_embs else None,
             )
-            (kept_ids if p["kept"] else pruned_ids).append(item_id)
+            page_items.append({
+                "item_id": item_id,
+                "url": url,
+                "content": content,
+                "chunks": unique_chunks,
+                "embs": unique_embs,
+                "subquery": p["subquery"],
+                "filter_kept": p["kept"],
+            })
+
+        kept_ids: list[str] = []
+        pruned_ids: list[str] = []
+        decision_type = "continue"
+        branch_allocation: dict[str, float] | None = None
+        decision_meta: dict[str, Any] = {}
+        result_node_ids = [make_item_id(r['researchGoal'], '') for r in results]
+        default_child_breadth = max(2, breadth // 2)
+        child_breadth: dict[str, int] = {nid: default_child_breadth for nid in result_node_ids}
+
+        if self.orchestrator is None:
+            # Legacy: record the EmbeddingsFilter's verdict, change nothing.
+            for pi in page_items:
+                (kept_ids if pi["filter_kept"] else pruned_ids).append(pi["item_id"])
+        else:
+            new_ids = {pi["item_id"] for pi in page_items}
+            new_items = [
+                PoolItem(
+                    item_id=pi["item_id"],
+                    source_url=pi["url"],
+                    text=pi["content"],
+                    embedding=_unit_mean(pi["embs"]) if pi["embs"] else None,
+                    tree_depth=current_tree_depth,
+                    retrieval_round=round_id,
+                    is_new=True,
+                    source_subquery=pi["subquery"] or "",
+                    chunks=pi["chunks"],
+                    chunk_embeddings=pi["embs"],
+                )
+                for pi in page_items
+            ]
+            retained_prev = [
+                PoolItem(
+                    item_id=e.item_id,
+                    source_url=e.source_url,
+                    text=e.content,
+                    embedding=e.embedding,
+                    tree_depth=e.tree_depth,
+                    retrieval_round=e.retrieval_round,
+                    is_new=False,
+                    source_subquery=e.source_subquery,
+                )
+                for e in self.trajectory_logger.get_retained_evidence().values()
+                if e.item_id not in new_ids
+            ]
+            tokens_now = TokenTracker.snapshot()
+            inp = OrchestrationInput(
+                root_query=self.researcher.query,
+                query_embedding=self.query_embedding,
+                subquestions=list(self.trajectory_logger.trajectory.subquestions),
+                new_items=new_items,
+                retained_prev=retained_prev,
+                frontier=[FrontierInfo(n.node_id, n.subquery) for n in frontier_nodes],
+                round_id=round_id,
+                tree_depth=current_tree_depth,
+                tokens_used=int(tokens_now.get("input_tokens", 0)) + int(tokens_now.get("output_tokens", 0)),
+                token_budget=self.token_budget,
+            )
+            decision = await self.orchestrator.decide(inp)
+
+            # m: apply retention and any compression to the logger's evidence.
+            for iid, text in decision.rewritten.items():
+                self.trajectory_logger.set_content(iid, text)
+            for it in inp.pool:
+                (kept_ids if it.item_id in decision.kept_ids else pruned_ids).append(it.item_id)
+
+            # Forward context for this level is rebuilt from the decision, not
+            # from what the sub-researchers' filters happened to return.
+            all_context = [
+                self._format_item(it.source_url, decision.text_for(it))
+                for it in new_items
+                if it.item_id in decision.kept_ids
+            ]
+
+            # u: stop every pending recursion once any round says terminate.
+            if decision.terminate:
+                self.stop_requested = True
+            decision_type = "terminate" if decision.terminate else "continue"
+
+            # w: split the same total child breadth the fork would have spent.
+            branch_allocation = dict(decision.branch_allocation)
+            child_breadth = allocate_breadth(
+                branch_allocation, result_node_ids, default_child_breadth * len(result_node_ids)
+            )
+
+            decision_meta = dict(decision.meta)
+            decision_meta["context_tokens_before"] = sum(it.tokens for it in inp.pool)
+            decision_meta["context_tokens_after"] = sum(
+                estimate_tokens(decision.text_for(it)) for it in inp.pool if it.item_id in decision.kept_ids
+            )
+            decision_meta["child_breadth"] = child_breadth
 
         tokens_after = TokenTracker.snapshot()
         latency_counts_after = LatencyTracker.snapshot()
@@ -631,19 +805,23 @@ Return ONLY a JSON object using this exact schema:
             pruned_item_ids=pruned_ids,
             frontier=frontier_nodes,
             round_cost=round_cost,
-            decision_type="continue",
+            decision_type=decision_type,
+            branch_allocation=branch_allocation,
+            policy=self.policy_name,
+            meta=decision_meta,
         )
 
         logger.info(
-            f"Round {round_id} checkpoint: depth={depth}, "
+            f"Round {round_id} checkpoint [{self.policy_name}]: depth={depth}, "
             f"kept={len(kept_ids)}, pruned={len(pruned_ids)}, "
-            f"frontier_nodes={len(frontier_nodes)}"
+            f"frontier_nodes={len(frontier_nodes)}, decision={decision_type}, "
+            f"child_breadth={child_breadth}"
         )
 
-        for result in results:
-            # Continue deeper if needed
-            if depth > 1:
-                new_breadth = max(2, breadth // 2)
+        for result, node_id in zip(results, result_node_ids):
+            # Continue deeper if needed, unless a policy asked to stop.
+            if depth > 1 and not self.stop_requested:
+                new_breadth = child_breadth.get(node_id, default_child_breadth)
                 new_depth = depth - 1
                 progress.current_depth += 1
 
@@ -701,6 +879,8 @@ Return ONLY a JSON object using this exact schema:
 
         follow_up_questions = await self.generate_research_plan(self.researcher.query)
         self.trajectory_logger.set_subquestions(follow_up_questions)
+        if self.orchestrator is not None and self.orchestrator.needs_embeddings:
+            await self._embed_query_and_subquestions(follow_up_questions)
         answers = ["Automatically proceeding with research"] * len(follow_up_questions)
 
         qa_pairs = [f"Q: {q}\nA: {a}" for q, a in zip(follow_up_questions, answers)]
@@ -724,6 +904,12 @@ Return ONLY a JSON object using this exact schema:
                 "research_costs": research_costs,
                 "total_costs": self.researcher.get_costs()
             })
+
+        # With a policy active the final evidence context is the retained set
+        # K_T as decided round by round (including supersession of earlier
+        # items and any compression), not the per-level lists.
+        if self.orchestrator is not None:
+            results['context'] = self._retained_context()
 
         # Prepare context with citations
         context_with_citations = []
