@@ -1,6 +1,7 @@
 from typing import Any, Dict, List
 import requests
-import os
+
+MAX_DOC_CHARS = 50000
 
 
 class CustomRetriever:
@@ -86,7 +87,9 @@ class CustomRetriever:
             cleaned.append(
                 {
                     "url": url,
-                    "raw_content": item.get("raw_content") or item.get("body") or "",
+                    "raw_content": (item.get("raw_content") or item.get("body") or "")[
+                        : self.MAX_DOC_CHARS
+                    ],
                 }
             )
         return cleaned
