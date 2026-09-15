@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List
 import requests
 
@@ -88,7 +89,7 @@ class CustomRetriever:
                 {
                     "url": url,
                     "raw_content": (item.get("raw_content") or item.get("body") or "")[
-                        : self.MAX_DOC_CHARS
+                        :MAX_DOC_CHARS
                     ],
                 }
             )
