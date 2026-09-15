@@ -46,7 +46,7 @@ class ReportGenerator:
             "headers": self.researcher.headers,
         }
 
-    async def write_report(self, existing_headers: list = [], relevant_written_contents: list = [], ext_context=None, custom_prompt="", available_images: list = None) -> str:
+    async def write_report(self, existing_headers: list = [], relevant_written_contents: list = [], ext_context=None, custom_prompt="", available_images: list = None, answer_format: str = "") -> str:
         """
         Write a report based on existing headers and relevant contents.
 
@@ -56,6 +56,8 @@ class ReportGenerator:
             ext_context (Optional): External context, if any.
             custom_prompt (str): Custom prompt for the report.
             available_images (list): Pre-generated images available for embedding.
+            answer_format (str): ``browsecomp`` writes Explanation / Exact Answer /
+                Confidence instead of a long report (also GR_ANSWER_FORMAT).
 
         Returns:
             str: The generated report.
@@ -110,6 +112,7 @@ class ReportGenerator:
         report_params["context"] = context
         report_params["custom_prompt"] = custom_prompt
         report_params["available_images"] = available_images  # Pass pre-generated images
+        report_params["answer_format"] = answer_format
 
         if self.researcher.report_type == "subtopic_report":
             report_params.update({

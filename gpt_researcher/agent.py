@@ -455,6 +455,7 @@ class GPTResearcher:
         relevant_written_contents: list = [],
         ext_context=None,
         custom_prompt="",
+        answer_format="",
     ) -> str:
         """Write the research report.
 
@@ -463,6 +464,8 @@ class GPTResearcher:
             relevant_written_contents: List of previously written content for context.
             ext_context: External context to use instead of internal context.
             custom_prompt: Custom prompt to guide report generation.
+            answer_format: ``browsecomp`` writes a short Exact Answer instead of
+                a long report. Also read from GR_ANSWER_FORMAT.
 
         Returns:
             The generated report as a string.
@@ -494,6 +497,7 @@ class GPTResearcher:
             ext_context=ext_context or self.context,
             custom_prompt=custom_prompt,
             available_images=self.available_images,  # Pass pre-generated images
+            answer_format=answer_format,
         )
 
         if _traj is not None:

@@ -415,6 +415,31 @@ The response MUST not contain any markdown format or additional text (like ```js
         )
 
     @staticmethod
+    def generate_browsecomp_answer_prompt(question: str, context, **_kwargs) -> str:
+        """Short-form answer for BrowseComp / BrowseComp-Plus.
+
+        The official grader extracts ``Exact Answer:`` from the response and
+        scores semantic match against the gold answer. A 2000-word research
+        report (the default deep-research prompt) buries that line and is
+        scored as wrong even when the fact is in the text.
+        """
+        return f"""You have completed research for the question below. Using ONLY the research context, produce a short-form answer.
+
+Question: {question}
+
+Research context:
+{context}
+
+Your response must be exactly three sections and nothing else:
+
+Explanation: <brief reasoning. If a source URL is bcp://<docid>, cite that docid in square brackets like [74874] at the end of the sentence it supports. Do not write a bibliography.>
+Exact Answer: <the succinct final answer — a name, date, number, or short phrase, not a paragraph>
+Confidence: <integer 0-100>%
+
+Do not use markdown headings. Do not repeat the question. Do not include a reference list. If the context is insufficient, still fill Exact Answer (use Unknown) and Confidence.
+"""
+
+    @staticmethod
     def generate_deep_research_prompt(
         question: str,
         context: str,
@@ -856,6 +881,7 @@ report_type_mapping = {
     ReportType.CustomReport.value: "generate_custom_report_prompt",
     ReportType.SubtopicReport.value: "generate_subtopic_report_prompt",
     ReportType.DeepResearch.value: "generate_deep_research_prompt",
+    ReportType.ShortAnswer.value: "generate_browsecomp_answer_prompt",
 }
 
 

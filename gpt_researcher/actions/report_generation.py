@@ -1,12 +1,25 @@
 import asyncio
+import os
 from typing import List, Dict, Any
 from ..config.config import Config
 from ..utils.llm import create_chat_completion
 from ..utils.logger import get_formatted_logger
 from ..prompts import PromptFamily, get_prompt_by_report_type
-from ..utils.enum import Tone
+from ..utils.enum import ReportType, Tone
 
 logger = get_formatted_logger()
+
+# Synthesis for BrowseComp / BrowseComp-Plus: a three-line answer, not a report.
+# Selected by write_report(answer_format="browsecomp"), GR_ANSWER_FORMAT, or
+# report_type="short_answer". Deep research still runs; only this write step changes.
+ANSWER_FORMAT_ENV = "GR_ANSWER_FORMAT"
+SHORT_ANSWER_FORMATS = {"browsecomp", "browsecomp_plus", "short_answer"}
+SHORT_ANSWER_MAX_TOKENS = 800
+SHORT_ANSWER_SYSTEM = (
+    "You extract a short factual answer from the research context. "
+    "Never write a report, title, table of contents, bibliography, or markdown headings. "
+    "Follow the user message's output format exactly."
+)
 
 
 async def write_report_introduction(
@@ -227,6 +240,7 @@ async def generate_report(
     headers=None,
     prompt_family: type[PromptFamily] | PromptFamily = PromptFamily,
     available_images: list = None,
+    answer_format: str = "",
     **kwargs
 ):
     """
@@ -245,46 +259,67 @@ async def generate_report(
         cost_callback:
         prompt_family: Family of prompts
         available_images: Pre-generated images to embed in the report
+        answer_format: ``browsecomp`` forces the BrowseComp three-line answer
+            (Explanation / Exact Answer / Confidence). Also set via
+            GR_ANSWER_FORMAT. Deep-research report_type stays ``deep``; this
+            only changes synthesis.
 
     Returns:
         report:
 
     """
     available_images = available_images or []
-    generate_prompt = get_prompt_by_report_type(report_type, prompt_family)
-    report = ""
+    answer_format = str(
+        answer_format or kwargs.pop("answer_format", "") or os.environ.get(ANSWER_FORMAT_ENV, "")
+    ).strip().lower()
+    use_short_answer = (
+        answer_format in SHORT_ANSWER_FORMATS
+        or report_type in {ReportType.ShortAnswer.value, "browsecomp"}
+    )
 
-    if report_type == "subtopic_report":
-        content = f"{generate_prompt(query, existing_headers, relevant_written_contents, main_topic, context, report_format=cfg.report_format, tone=tone, total_words=cfg.total_words, language=cfg.language)}"
-    elif custom_prompt:
-        content = f"{custom_prompt}\n\nContext: {context}"
+    if use_short_answer:
+        content = prompt_family.generate_browsecomp_answer_prompt(query, context)
+        agent_role_prompt = SHORT_ANSWER_SYSTEM
+        max_tokens = min(
+            int(getattr(cfg, "smart_token_limit", SHORT_ANSWER_MAX_TOKENS) or SHORT_ANSWER_MAX_TOKENS),
+            SHORT_ANSWER_MAX_TOKENS,
+        )
+        temperature = 0.0
     else:
-        content = f"{generate_prompt(query, context, report_source, report_format=cfg.report_format, tone=tone, total_words=cfg.total_words, language=cfg.language)}"
-    
-    # Add available images instruction if images were pre-generated
-    if available_images:
-        # Only embed image dicts that carry a usable URL. Callers (and
-        # partial LLM metadata) may pass None rows, non-dicts, or dicts
-        # missing ``url``; a bare ``img['url']`` KeyError/TypeError would
-        # abort the whole report write path.
-        image_lines = []
-        for i, img in enumerate(available_images):
-            if not isinstance(img, dict):
-                continue
-            url = img.get("url") or ""
-            if not url:
-                continue
-            alt = img.get("title") or img.get("alt_text") or "Illustration"
-            hint = img.get("section_hint") or "General"
-            image_lines.append(
-                f"- Image {len(image_lines)+1}: ![{alt}]({url}) - {hint}"
-            )
-        if not image_lines:
-            images_info = ""
+        generate_prompt = get_prompt_by_report_type(report_type, prompt_family)
+        if report_type == "subtopic_report":
+            content = f"{generate_prompt(query, existing_headers, relevant_written_contents, main_topic, context, report_format=cfg.report_format, tone=tone, total_words=cfg.total_words, language=cfg.language)}"
+        elif custom_prompt:
+            content = f"{custom_prompt}\n\nContext: {context}"
         else:
-            images_info = "\n".join(image_lines)
-        if images_info:
-            content += f"""
+            content = f"{generate_prompt(query, context, report_source, report_format=cfg.report_format, tone=tone, total_words=cfg.total_words, language=cfg.language)}"
+        max_tokens = cfg.smart_token_limit
+        temperature = 0.35
+
+        # Add available images instruction if images were pre-generated
+        if available_images:
+            # Only embed image dicts that carry a usable URL. Callers (and
+            # partial LLM metadata) may pass None rows, non-dicts, or dicts
+            # missing ``url``; a bare ``img['url']`` KeyError/TypeError would
+            # abort the whole report write path.
+            image_lines = []
+            for i, img in enumerate(available_images):
+                if not isinstance(img, dict):
+                    continue
+                url = img.get("url") or ""
+                if not url:
+                    continue
+                alt = img.get("title") or img.get("alt_text") or "Illustration"
+                hint = img.get("section_hint") or "General"
+                image_lines.append(
+                    f"- Image {len(image_lines)+1}: ![{alt}]({url}) - {hint}"
+                )
+            if not image_lines:
+                images_info = ""
+            else:
+                images_info = "\n".join(image_lines)
+            if images_info:
+                content += f"""
 
 AVAILABLE IMAGES:
 You have the following pre-generated images available. Embed them in relevant sections of your report using the exact markdown syntax provided:
@@ -292,6 +327,8 @@ You have the following pre-generated images available. Embed them in relevant se
 {images_info}
 
 Place each image on its own line after the relevant section header or paragraph. Use all available images where they add value to the content."""
+
+    report = ""
     try:
         report = await create_chat_completion(
             model=cfg.smart_llm_model,
@@ -299,11 +336,11 @@ Place each image on its own line after the relevant section header or paragraph.
                 {"role": "system", "content": f"{agent_role_prompt}"},
                 {"role": "user", "content": content},
             ],
-            temperature=0.35,
+            temperature=temperature,
             llm_provider=cfg.smart_llm_provider,
             stream=True,
             websocket=websocket,
-            max_tokens=cfg.smart_token_limit,
+            max_tokens=max_tokens,
             llm_kwargs=cfg.llm_kwargs,
             cost_callback=cost_callback,
             usage_tag="report_generation",
@@ -316,11 +353,11 @@ Place each image on its own line after the relevant section header or paragraph.
                 messages=[
                     {"role": "user", "content": f"{agent_role_prompt}\n\n{content}"},
                 ],
-                temperature=0.35,
+                temperature=temperature,
                 llm_provider=cfg.smart_llm_provider,
                 stream=True,
                 websocket=websocket,
-                max_tokens=cfg.smart_token_limit,
+                max_tokens=max_tokens,
                 llm_kwargs=cfg.llm_kwargs,
                 cost_callback=cost_callback,
                 usage_tag="report_generation",
