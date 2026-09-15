@@ -9,6 +9,21 @@ from .utils.enum import PromptFamily as PromptFamilyEnum
 from typing import Callable, List, Dict, Any
 
 
+# Verbatim from texttron/BrowseComp-Plus search_agent/prompts.py. Default
+# ``--query-template`` for search_agent/openai_client.py. Double braces are
+# literal braces after ``.format(Question=...)``.
+QUERY_TEMPLATE_NO_GET_DOCUMENT = """
+You are a deep research agent. You need to answer the given question by interacting with a search engine, using the search tool provided. Please perform reasoning and use the tool step by step, in an interleaved manner. You may use the search tool multiple times.
+
+Question: {Question}
+
+Your response should be in the following format:
+Explanation: {{your explanation for your final answer. For this explanation section only, you should cite your evidence documents inline by enclosing their docids in square brackets [] at the end of sentences. For example, [20].}}
+Exact Answer: {{your succinct, final answer}}
+Confidence: {{your confidence score between 0% and 100% for your answer}}
+""".strip()
+
+
 ## Prompt Families #############################################################
 
 class PromptFamily:
@@ -416,28 +431,22 @@ The response MUST not contain any markdown format or additional text (like ```js
 
     @staticmethod
     def generate_browsecomp_answer_prompt(question: str, context, **_kwargs) -> str:
-        """Short-form answer for BrowseComp / BrowseComp-Plus.
+        """Final answer in the official BrowseComp-Plus format.
 
-        The official grader extracts ``Exact Answer:`` from the response and
-        scores semantic match against the gold answer. A 2000-word research
-        report (the default deep-research prompt) buries that line and is
-        scored as wrong even when the fact is in the text.
+        Papers and ``texttron/BrowseComp-Plus`` ``openai_client.py`` wrap the
+        question with ``QUERY_TEMPLATE_NO_GET_DOCUMENT`` as the user message
+        and take the last assistant turn as ``Explanation`` / ``Exact Answer``
+        / ``Confidence``. gpt-researcher searches first, then ``write_report``
+        is that last turn, so the same template is applied here and the
+        gathered documents (search-tool analogue) are appended. The research
+        query itself stays unwrapped so BM25 is not poisoned by the template.
         """
-        return f"""You have completed research for the question below. Using ONLY the research context, produce a short-form answer.
-
-Question: {question}
-
-Research context:
-{context}
-
-Your response must be exactly three sections and nothing else:
-
-Explanation: <brief reasoning. If a source URL is bcp://<docid>, cite that docid in square brackets like [74874] at the end of the sentence it supports. Do not write a bibliography.>
-Exact Answer: <the succinct final answer — a name, date, number, or short phrase, not a paragraph>
-Confidence: <integer 0-100>%
-
-Do not use markdown headings. Do not repeat the question. Do not include a reference list. If the context is insufficient, still fill Exact Answer (use Unknown) and Confidence.
-"""
+        if isinstance(context, list):
+            context = "\n".join(str(c) for c in context)
+        formatted = QUERY_TEMPLATE_NO_GET_DOCUMENT.format(Question=question)
+        if not str(context or "").strip():
+            return formatted
+        return f"{formatted}\n\n{context}"
 
     @staticmethod
     def generate_deep_research_prompt(

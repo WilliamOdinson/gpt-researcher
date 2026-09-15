@@ -464,8 +464,8 @@ class GPTResearcher:
             relevant_written_contents: List of previously written content for context.
             ext_context: External context to use instead of internal context.
             custom_prompt: Custom prompt to guide report generation.
-            answer_format: ``browsecomp`` writes a short Exact Answer instead of
-                a long report. Also read from GR_ANSWER_FORMAT.
+            answer_format: ``browsecomp`` writes a short Exact Answer using the
+                official QUERY_TEMPLATE_NO_GET_DOCUMENT. Also GR_ANSWER_FORMAT.
 
         Returns:
             The generated report as a string.

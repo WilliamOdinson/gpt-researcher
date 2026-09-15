@@ -56,8 +56,8 @@ class ReportGenerator:
             ext_context (Optional): External context, if any.
             custom_prompt (str): Custom prompt for the report.
             available_images (list): Pre-generated images available for embedding.
-            answer_format (str): ``browsecomp`` writes Explanation / Exact Answer /
-                Confidence instead of a long report (also GR_ANSWER_FORMAT).
+            answer_format (str): ``browsecomp`` writes the official BrowseComp-Plus
+                QUERY_TEMPLATE_NO_GET_DOCUMENT answer (also GR_ANSWER_FORMAT).
 
         Returns:
             str: The generated report.

@@ -9,17 +9,15 @@ from ..utils.enum import ReportType, Tone
 
 logger = get_formatted_logger()
 
-# Synthesis for BrowseComp / BrowseComp-Plus: a three-line answer, not a report.
+# Synthesis for BrowseComp / BrowseComp-Plus: official QUERY_TEMPLATE_NO_GET_DOCUMENT
+# as the last user message (openai_client.py default), not a 2000-word report.
 # Selected by write_report(answer_format="browsecomp"), GR_ANSWER_FORMAT, or
 # report_type="short_answer". Deep research still runs; only this write step changes.
 ANSWER_FORMAT_ENV = "GR_ANSWER_FORMAT"
 SHORT_ANSWER_FORMATS = {"browsecomp", "browsecomp_plus", "short_answer"}
-SHORT_ANSWER_MAX_TOKENS = 800
-SHORT_ANSWER_SYSTEM = (
-    "You extract a short factual answer from the research context. "
-    "Never write a report, title, table of contents, bibliography, or markdown headings. "
-    "Follow the user message's output format exactly."
-)
+# openai_client.py --max-tokens default. Do not cap below this; a 800-token
+# budget can truncate Explanation + Exact Answer + Confidence.
+OFFICIAL_COMPLETION_MAX_TOKENS = 10000
 
 
 async def write_report_introduction(
@@ -259,10 +257,10 @@ async def generate_report(
         cost_callback:
         prompt_family: Family of prompts
         available_images: Pre-generated images to embed in the report
-        answer_format: ``browsecomp`` forces the BrowseComp three-line answer
-            (Explanation / Exact Answer / Confidence). Also set via
-            GR_ANSWER_FORMAT. Deep-research report_type stays ``deep``; this
-            only changes synthesis.
+        answer_format: ``browsecomp`` uses the official BrowseComp-Plus
+            QUERY_TEMPLATE_NO_GET_DOCUMENT (Explanation / Exact Answer /
+            Confidence). Also set via GR_ANSWER_FORMAT. Deep-research
+            report_type stays ``deep``; this only changes synthesis.
 
     Returns:
         report:
@@ -279,12 +277,15 @@ async def generate_report(
 
     if use_short_answer:
         content = prompt_family.generate_browsecomp_answer_prompt(query, context)
-        agent_role_prompt = SHORT_ANSWER_SYSTEM
-        max_tokens = min(
-            int(getattr(cfg, "smart_token_limit", SHORT_ANSWER_MAX_TOKENS) or SHORT_ANSWER_MAX_TOKENS),
-            SHORT_ANSWER_MAX_TOKENS,
+        # Official openai_client.py default --system is None; the template is
+        # the user message. Do not inject a competing researcher system role.
+        agent_role_prompt = ""
+        max_tokens = max(
+            int(getattr(cfg, "smart_token_limit", 0) or 0),
+            OFFICIAL_COMPLETION_MAX_TOKENS,
         )
         temperature = 0.0
+        messages = [{"role": "user", "content": content}]
     else:
         generate_prompt = get_prompt_by_report_type(report_type, prompt_family)
         if report_type == "subtopic_report":
@@ -327,15 +328,16 @@ You have the following pre-generated images available. Embed them in relevant se
 {images_info}
 
 Place each image on its own line after the relevant section header or paragraph. Use all available images where they add value to the content."""
+        messages = [
+            {"role": "system", "content": f"{agent_role_prompt}"},
+            {"role": "user", "content": content},
+        ]
 
     report = ""
     try:
         report = await create_chat_completion(
             model=cfg.smart_llm_model,
-            messages=[
-                {"role": "system", "content": f"{agent_role_prompt}"},
-                {"role": "user", "content": content},
-            ],
+            messages=messages,
             temperature=temperature,
             llm_provider=cfg.smart_llm_provider,
             stream=True,
@@ -348,10 +350,11 @@ Place each image on its own line after the relevant section header or paragraph.
         )
     except Exception:
         try:
+            fallback = content if not agent_role_prompt else f"{agent_role_prompt}\n\n{content}"
             report = await create_chat_completion(
                 model=cfg.smart_llm_model,
                 messages=[
-                    {"role": "user", "content": f"{agent_role_prompt}\n\n{content}"},
+                    {"role": "user", "content": fallback},
                 ],
                 temperature=temperature,
                 llm_provider=cfg.smart_llm_provider,
