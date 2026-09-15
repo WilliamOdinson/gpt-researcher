@@ -282,6 +282,8 @@ class DeepResearchSkill:
                 "role": "system",
                 "content": (
                     "You are an expert researcher generating search queries. "
+                    "Each query must be a short keyword phrase under 80 characters, suitable for a web search engine. "
+                    "Do not copy the user's full prompt into the query. "
                     "Return valid JSON only. Do not include markdown, code fences, bullets, numbering, or prose."
                 ),
             },
