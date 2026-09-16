@@ -179,6 +179,10 @@ test = [
     "pytest-timeout>=2.3",
     "pytest-forked>=1.6",
 ]
+# GR_ORCHESTRATOR=llmlingua (Table 4 "prompt compression" row).
+orchestration = [
+    "llmlingua>=0.2.2",
+]
 requirements-txt = [
     "ag2[openai]>=0.11.2",
     "arxiv_client",
