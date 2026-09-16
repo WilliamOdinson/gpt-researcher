@@ -17,6 +17,8 @@ class ReportType(Enum):
         DetailedReport: In-depth detailed analysis report.
         SubtopicReport: Report focused on a specific subtopic.
         DeepResearch: Deep research mode with extensive analysis.
+        ShortAnswer: BrowseComp / BrowseComp-Plus three-line answer
+            (Explanation / Exact Answer / Confidence), not a long report.
     """
     ResearchReport = "research_report"
     ResourceReport = "resource_report"
@@ -25,6 +27,7 @@ class ReportType(Enum):
     DetailedReport = "detailed_report"
     SubtopicReport = "subtopic_report"
     DeepResearch = "deep"
+    ShortAnswer = "short_answer"
 
 
 class ReportSource(Enum):
