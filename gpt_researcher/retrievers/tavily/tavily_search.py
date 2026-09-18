@@ -1,15 +1,20 @@
 """Tavily API search retriever for GPT Researcher.
 
 This module provides the TavilySearch class for performing web searches
-using the Tavily API.
+using the Tavily API, with automatic key rotation when a key is exhausted.
 """
 
 import json
+import logging
 import os
 import re
-from typing import Literal, Optional, Sequence
+from typing import Literal, Sequence
 
 import requests
+
+from .key_manager import TavilyKeyManager
+
+logger = logging.getLogger(__name__)
 
 # Google-style site:domain operators, which the Tavily API does not support.
 _SITE_OPERATOR_PATTERN = re.compile(r"site:(\S+)", re.IGNORECASE)
@@ -38,29 +43,24 @@ class TavilySearch:
         self.headers = headers or {}
         self.topic = topic
         self.base_url = "https://api.tavily.com/search"
-        self.api_key = self.get_api_key()
+        self._key_manager = TavilyKeyManager()
+        self.api_key = self._resolve_api_key()
         self.headers = {
             "Content-Type": "application/json",
         }
         self.query_domains = query_domains or None
 
-    def get_api_key(self):
-        """
-        Gets the Tavily API key
-        Returns:
-
-        """
-        api_key = self.headers.get("tavily_api_key")
-        if not api_key:
-            try:
-                api_key = os.environ["TAVILY_API_KEY"]
-            except KeyError:
-                print(
-                    "Tavily API key not found, set to blank. If you need a retriver, please set the TAVILY_API_KEY environment variable."
-                )
-                return ""
-        return api_key
-
+    def _resolve_api_key(self) -> str:
+        """Resolve the API key: prefer header override, then key manager (CSV pool),
+        then TAVILY_API_KEY env var as last resort."""
+        header_key = self.headers.get("tavily_api_key")
+        if header_key:
+            return header_key
+        try:
+            return self._key_manager.current_key
+        except (FileNotFoundError, RuntimeError):
+            # CSV not available; fall back to env var
+            return os.environ.get("TAVILY_API_KEY", "")
 
     def _search(
         self,
@@ -76,9 +76,7 @@ class TavilySearch:
         include_images: bool = False,
         use_cache: bool = True,
     ) -> dict:
-        """
-        Internal search method to send the request to the API.
-        """
+        """Internal search method with automatic key rotation on exhaustion."""
 
         data = {
             "query": query,
@@ -91,18 +89,32 @@ class TavilySearch:
             "include_domains": include_domains,
             "exclude_domains": exclude_domains,
             "include_images": include_images,
-            "api_key": self.api_key,
             "use_cache": use_cache,
         }
 
-        response = requests.post(
-            self.base_url, data=json.dumps(data), headers=self.headers, timeout=100
-        )
+        while True:
+            data["api_key"] = self.api_key
+            response = requests.post(
+                self.base_url, data=json.dumps(data), headers=self.headers, timeout=100
+            )
 
-        if response.status_code == 200:
-            return response.json()
-        else:
-            # Raises a HTTPError if the HTTP request returned an unsuccessful status code
+            if response.status_code == 200:
+                return response.json()
+
+            if TavilyKeyManager.is_exhausted_status(response.status_code):
+                logger.warning(
+                    "Tavily key ...%s hit HTTP %d, rotating.",
+                    self.api_key[-6:],
+                    response.status_code,
+                )
+                next_key = self._key_manager.rotate()
+                if next_key is None:
+                    # No more keys; raise so the caller gets the real error
+                    response.raise_for_status()
+                self.api_key = next_key
+                continue
+
+            # Non-rotation error, propagate immediately
             response.raise_for_status()
 
     def search(self, max_results=10):
