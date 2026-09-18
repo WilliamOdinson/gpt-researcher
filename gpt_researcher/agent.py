@@ -8,7 +8,7 @@ import asyncio
 import time
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .actions import (
     add_references,
@@ -81,6 +81,7 @@ class GPTResearcher:
         mcp_configs: list[dict] | None = None,
         mcp_max_iterations: int | None = None,
         mcp_strategy: str | None = None,
+        sub_query_gate: Optional[Callable[[list[dict]], Awaitable[list[dict]]]] = None,
         **kwargs
     ):
         """
@@ -135,6 +136,14 @@ class GPTResearcher:
                 - "fast" (default): Run MCP once with original query for best performance
                 - "deep": Run MCP for all sub-queries for maximum thoroughness
                 - "disabled": Skip MCP entirely, use only web retrievers
+            sub_query_gate (callable, optional): Async hook invoked with the deep-research
+                planner's proposed serp_queries (list of {"query", "researchGoal"} dicts)
+                for a round, after generation and before any of them run. Must return the
+                (possibly filtered or rewritten) list to actually execute; a dropped entry
+                never spawns a sub-researcher, so its follow-up branches never exist. Only
+                consulted by deep_research(); if None (default), all proposed queries run
+                unmodified. Not propagated to the nested per-query sub-researchers (they
+                run report_type="research_report" and do not consult this hook).
         """
         self.kwargs = kwargs
         self.query = query
@@ -168,6 +177,7 @@ class GPTResearcher:
         self._current_step: str = "general"
         self.log_handler = log_handler
         self.prompt_family = get_prompt_family(prompt_family or self.cfg.prompt_family, self.cfg)
+        self.sub_query_gate = sub_query_gate
 
         # Process MCP configurations if provided
         self.mcp_configs = mcp_configs

@@ -359,6 +359,11 @@ Return ONLY a JSON object using this exact schema:
             model=self.researcher.cfg.strategic_llm_model,
             reasoning_effort=ReasoningEfforts.High.value,
             temperature=0.4,
+            # Needs headroom for reasoning tokens on reasoning models (same
+            # issue as process_research_results below): the function default
+            # of 4000 can be entirely consumed by "high"-effort reasoning on
+            # a real prompt, leaving nothing for the actual JSON answer.
+            max_tokens=16000,
             llm_kwargs=self.researcher.cfg.llm_kwargs,
             usage_tag="deep_research_plan",
         )
@@ -438,6 +443,16 @@ Return ONLY a JSON object using this exact schema:
         print(f"🔎 Generating {breadth} search queries...", flush=True)
         serp_queries = await self.generate_search_queries(query, num_queries=breadth)
         print(f"✅ Generated {len(serp_queries)} queries: {[q['query'] for q in serp_queries]}", flush=True)
+
+        sub_query_gate = getattr(self.researcher, "sub_query_gate", None)
+        if sub_query_gate is not None:
+            gated_queries = await sub_query_gate(serp_queries)
+            logger.info(
+                "Sub-query gate: %d proposed -> %d kept at depth=%s",
+                len(serp_queries), len(gated_queries), depth,
+            )
+            serp_queries = gated_queries
+
         progress.total_queries = len(serp_queries)
         if not serp_queries:
             logger.warning("Deep research generated zero search queries; stopping descent.")
