@@ -23,21 +23,29 @@ class EvidenceItem:
     embedding: list[float] | None = None
     source_type: str = "web"
     was_retained: bool = True
+    # Set when an orchestration policy rewrote (compressed) the content.
+    original_word_count: int | None = None
+    compressed: bool = False
 
 
 @dataclass
 class RoundDecision:
     # continue / prune / expand / terminate / reallocate
     type: str
-    # kept_item_ids / pruned_item_ids cover only items that received a decision
-    # in this round (i.e. items produced by this round's sub-queries). They are
-    # not a full-pool mask; see RoundSnapshot.retained_ids for the full K_t.
+    # kept_item_ids / pruned_item_ids cover every item the policy saw this
+    # round: items produced by this round's sub-queries plus previously
+    # retained items it re-examined. Under GR_ORCHESTRATOR=legacy only this
+    # round's items appear. See RoundSnapshot.retained_ids for the full K_t.
     kept_item_ids: list[str] = field(default_factory=list)
     pruned_item_ids: list[str] = field(default_factory=list)
-    # Maps subquery node_id to allocated breadth fraction.
-    # Currently empty because deep research uses fixed breadth // 2;
-    # populated when a learned orchestrator provides reallocation decisions.
+    # Maps frontier node_id to the fraction of next-level breadth it gets.
+    # Empty under legacy (fixed breadth // 2); filled by every policy otherwise.
     branch_allocation: dict[str, float] = field(default_factory=dict)
+    # Which orchestration policy produced this decision ("legacy", "none",
+    # "topk", ...) and any policy-specific detail (scores, budget, parse flags,
+    # context_tokens_before/after).
+    policy: str = "legacy"
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -160,6 +168,18 @@ class TrajectoryLogger:
         )
         return item_id
 
+    def set_content(self, item_id: str, content: str) -> None:
+        """Replace an item's text after a policy compressed it. Keeps the
+        original word count so compression ratios can be recovered."""
+        item = self._global_evidence.get(item_id)
+        if item is None or item.content == content:
+            return
+        if item.original_word_count is None:
+            item.original_word_count = item.word_count
+        item.content = content
+        item.word_count = len(content.split())
+        item.compressed = True
+
     def record_round(
         self,
         kept_item_ids: list[str],
@@ -168,6 +188,8 @@ class TrajectoryLogger:
         round_cost: RoundCost,
         decision_type: str = "continue",
         branch_allocation: dict[str, float] | None = None,
+        policy: str = "legacy",
+        meta: dict[str, Any] | None = None,
     ):
         kept = set(kept_item_ids)
         pruned = set(pruned_item_ids) - kept
@@ -198,6 +220,8 @@ class TrajectoryLogger:
                 kept_item_ids=sorted(kept),
                 pruned_item_ids=sorted(pruned),
                 branch_allocation=branch_allocation or {},
+                policy=policy,
+                meta=dict(meta or {}),
             ),
             frontier=list(frontier),
             round_cost=round_cost,
