@@ -1,27 +1,26 @@
 from bs4 import BeautifulSoup
+import logging
 import os
 from ..utils import get_relevant_images, extract_title
+from gpt_researcher.retrievers.tavily.key_manager import TavilyKeyManager
+
+logger = logging.getLogger(__name__)
+
 
 class TavilyExtract:
 
     def __init__(self, link, session=None):
         self.link = link
         self.session = session
+        self._key_manager = TavilyKeyManager()
         from tavily import TavilyClient
-        self.tavily_client = TavilyClient(api_key=self.get_api_key())
+        self.tavily_client = TavilyClient(api_key=self._resolve_api_key())
 
-    def get_api_key(self) -> str:
-        """
-        Gets the Tavily API key
-        Returns:
-        Api key (str)
-        """
+    def _resolve_api_key(self) -> str:
         try:
-            api_key = os.environ["TAVILY_API_KEY"]
-        except KeyError:
-            raise Exception(
-                "Tavily API key not found. Please set the TAVILY_API_KEY environment variable.")
-        return api_key
+            return self._key_manager.current_key
+        except (FileNotFoundError, RuntimeError):
+            return os.environ.get("TAVILY_API_KEY", "")
 
     def scrape(self) -> tuple:
         """
