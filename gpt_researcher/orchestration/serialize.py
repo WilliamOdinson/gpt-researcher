@@ -90,6 +90,11 @@ def serialize_state(
     )
     lines.append("")
     lines.append(f"Evidence (id | {' '.join(feature_names)} | status | source | snippet):")
+    # Canonical order (retained first, then by id) so a prompt rebuilt from a
+    # saved trajectory is byte-identical to the one built online, where the
+    # pool order depends on dict insertion.
+    items = sorted(items, key=lambda it: (it.is_new, it.item_id))
+    frontier = sorted(frontier, key=lambda f: f.node_id)
     for it in items:
         feats = " ".join(_fmt_feature(n, float(v)) for n, v in zip(feature_names, it.features))
         status = "new" if it.is_new else "retained"
@@ -119,12 +124,14 @@ def serialize_action(
     branch_allocation: Mapping[str, float],
     terminate: bool,
 ) -> str:
-    kept = [i for i in pool_ids if i in set(kept_ids)]  # pool order, deterministic
-    keep_txt = "ALL" if pool_ids and len(kept) == len(pool_ids) else " ".join(kept)
+    pool = set(pool_ids)
+    kept = sorted(i for i in kept_ids if i in pool)  # canonical order
+    keep_txt = "ALL" if pool and len(kept) == len(pool) else " ".join(kept)
     total = sum(max(0.0, float(v)) for v in branch_allocation.values())
     if branch_allocation and total > 0:
         alloc_txt = " ".join(
-            f"{nid}={max(0.0, float(w)) / total:.2f}" for nid, w in branch_allocation.items()
+            f"{nid}={max(0.0, float(branch_allocation[nid])) / total:.2f}"
+            for nid in sorted(branch_allocation)
         )
     else:
         alloc_txt = "-"
