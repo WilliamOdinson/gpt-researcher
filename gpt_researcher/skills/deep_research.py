@@ -341,6 +341,20 @@ class DeepResearchSkill:
         except Exception as e:
             logger.warning(f"Query embedding for orchestrator failed (non-fatal): {e}")
 
+    async def _embed_texts(self, texts: List[str]) -> List[Optional[List[float]]]:
+        """Embed short strings (frontier sub-queries) for per-branch coverage
+        gaps. Non-fatal: returns ``None`` per text when the embedder is
+        unavailable, and policies fall back to a gap of 1.0."""
+        if not texts:
+            return []
+        try:
+            emb_model = self.researcher.memory.get_embeddings()
+            vecs = await asyncio.to_thread(emb_model.embed_documents, list(texts))
+            return [list(v) for v in vecs]
+        except Exception as e:
+            logger.warning(f"Frontier embedding for orchestrator failed (non-fatal): {e}")
+            return [None for _ in texts]
+
     async def generate_search_queries(self, query: str, num_queries: int = 3) -> List[Dict[str, str]]:
         """Generate SERP queries for research"""
         messages = [
@@ -738,17 +752,27 @@ Return ONLY a JSON object using this exact schema:
                 if e.item_id not in new_ids
             ]
             tokens_now = TokenTracker.snapshot()
+            # Branch sub-query vectors let policies score the coverage gap of
+            # each open branch (allocation prior). Only policies that opt in
+            # pay for it, so the Table-4 baselines' cost profile is unchanged.
+            frontier_embs: list[Optional[list[float]]] = [None] * len(frontier_nodes)
+            if getattr(self.orchestrator, "needs_frontier_embeddings", False) and frontier_nodes:
+                frontier_embs = await self._embed_texts([n.subquery for n in frontier_nodes])
             inp = OrchestrationInput(
                 root_query=self.researcher.query,
                 query_embedding=self.query_embedding,
                 subquestions=list(self.trajectory_logger.trajectory.subquestions),
                 new_items=new_items,
                 retained_prev=retained_prev,
-                frontier=[FrontierInfo(n.node_id, n.subquery) for n in frontier_nodes],
+                frontier=[
+                    FrontierInfo(n.node_id, n.subquery, emb)
+                    for n, emb in zip(frontier_nodes, frontier_embs)
+                ],
                 round_id=round_id,
                 tree_depth=current_tree_depth,
                 tokens_used=int(tokens_now.get("input_tokens", 0)) + int(tokens_now.get("output_tokens", 0)),
                 token_budget=self.token_budget,
+                subquestion_embeddings=[list(v) for v in self.subq_embeddings],
             )
             decision = await self.orchestrator.decide(inp)
 

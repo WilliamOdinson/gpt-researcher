@@ -214,3 +214,54 @@ async def test_none_recursion_matches_legacy_effort(monkeypatch):
     assert MockR.call_count == 6
     for snap in skill.trajectory_logger.trajectory.rounds:
         assert set(snap.decision.meta["child_breadth"].values()) == {2}
+
+
+# ------------------------------------------------------------------ random
+
+
+async def test_random_policy_acts_and_logs_features(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "random")
+    monkeypatch.setenv("GR_ORCH_SEED", "123")
+    # Pin the keep ratio so the assertion on the mask is exact: 2 of 3 pages.
+    monkeypatch.setenv("GR_RANDOM_PARAMS", '{"keep_ratio": 0.6, "temperature": 0.001, "p_terminate": 0.0, "min_rounds": 1, "phi_gain_stop": 0.0}')
+    skill = DeepResearchSkill(_researcher(depth=1, breadth=2))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[1.0, 0.0, 0.0]]
+
+    out, _ = await _run(skill, depth=1, breadth=2)
+    snap = skill.trajectory_logger.trajectory.rounds[0]
+    ids = {e.source_url: iid for iid, e in skill.trajectory_logger.get_all_evidence().items()}
+
+    assert snap.decision.policy == "random"
+    assert len(snap.decision.kept_item_ids) == 2
+    # With ~no noise the two on-topic pages (A, C) beat the off-topic B.
+    assert set(snap.decision.kept_item_ids) == {ids["https://a"], ids["https://c"]}
+    assert snap.decision.pruned_item_ids == [ids["https://b"]]
+    assert set(snap.decision.branch_allocation) == {make_item_id("goal 1", ""), make_item_id("goal 2", "")}
+    assert sum(snap.decision.branch_allocation.values()) == pytest.approx(1.0)
+
+    meta = snap.decision.meta
+    assert meta["params"]["keep_ratio"] == 0.6
+    assert set(meta["features"]) == set(ids.values())
+    assert meta["feature_names"][0] == "rho"
+    # No embedder on the fake researcher: frontier gaps fall back to 1.0.
+    assert all(v["gap"] == 1.0 for v in meta["frontier_stats"].values())
+    assert "child_breadth" in meta and "context_tokens_after" in meta
+    # Forward context is rebuilt from the mask.
+    joined = "\n".join(out["context"])
+    assert "https://a" in joined and "https://c" in joined and "https://b" not in joined
+
+
+async def test_random_policy_same_seed_same_trajectory(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "random")
+    monkeypatch.setenv("GR_ORCH_SEED", "7")
+    monkeypatch.delenv("GR_RANDOM_PARAMS", raising=False)
+
+    async def one():
+        skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
+        skill.query_embedding = [1.0, 0.0, 0.0]
+        await _run(skill, depth=2, breadth=4)
+        rounds = skill.trajectory_logger.trajectory.rounds
+        return [(sorted(r.decision.kept_item_ids), r.decision.type, r.decision.meta["child_breadth"]) for r in rounds]
+
+    assert await one() == await one()

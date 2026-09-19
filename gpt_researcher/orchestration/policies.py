@@ -29,7 +29,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-POLICY_NAMES = ("legacy", "none", "topk", "extractive", "llmlingua", "prompted")
+POLICY_NAMES = ("legacy", "none", "topk", "extractive", "llmlingua", "prompted", "random")
 DEFAULT_POLICY = "legacy"
 
 ENV_POLICY = "GR_ORCHESTRATOR"
@@ -37,6 +37,10 @@ ENV_BUDGET = "GR_CONTEXT_BUDGET_TOKENS"
 ENV_TOPK_K = "GR_TOPK_K"
 ENV_RATE = "GR_COMPRESSION_RATE"
 ENV_LLMLINGUA_MODEL = "GR_LLMLINGUA_MODEL"
+# RandomizedPolicy: base seed (per-query seeds are derived from it) and an
+# optional JSON dict that pins some or all sampled parameters.
+ENV_SEED = "GR_ORCH_SEED"
+ENV_RANDOM_PARAMS = "GR_RANDOM_PARAMS"
 
 _DEFAULT_LLMLINGUA_MODEL = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
 
@@ -88,6 +92,9 @@ class PoolItem:
 class FrontierInfo:
     node_id: str
     subquery: str
+    # Embedding of the branch sub-query, when the checkpoint could compute it.
+    # Used for per-branch coverage gaps; policies must tolerate ``None``.
+    embedding: list[float] | None = None
 
 
 @dataclass
@@ -102,6 +109,8 @@ class OrchestrationInput:
     tree_depth: int
     tokens_used: int
     token_budget: int | None
+    # e(q^(k)) for each entry of ``subquestions``; empty when unavailable.
+    subquestion_embeddings: list[list[float]] = field(default_factory=list)
 
     @property
     def pool(self) -> list[PoolItem]:
@@ -181,6 +190,9 @@ def _snippet(text: str, n: int = 200) -> str:
 class OrchestrationPolicy:
     name: str = "base"
     needs_embeddings: bool = False
+    # Opt in to one extra (small) embedding call per round for the frontier
+    # sub-queries, populating ``FrontierInfo.embedding``.
+    needs_frontier_embeddings: bool = False
 
     async def decide(self, inp: OrchestrationInput) -> OrchestrationDecision:  # pragma: no cover
         raise NotImplementedError
@@ -406,11 +418,6 @@ class LLMLinguaPolicy(OrchestrationPolicy):
 
 LLMCall = Callable[[list[dict[str, str]]], Awaitable[str]]
 
-_KEEP_RE = re.compile(r"^\s*KEEP\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
-_ALLOC_RE = re.compile(r"^\s*ALLOC\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
-_DECISION_RE = re.compile(r"^\s*DECISION\s*:\s*(CONTINUE|TERMINATE)", re.IGNORECASE | re.MULTILINE)
-_PAIR_RE = re.compile(r"([A-Za-z0-9_\-]+)\s*=\s*([0-9]*\.?[0-9]+)")
-
 
 class PromptedPolicy(OrchestrationPolicy):
     """Row 5. One LLM call per round sees the raw pool (ids, similarity,
@@ -470,42 +477,18 @@ class PromptedPolicy(OrchestrationPolicy):
         return "\n".join(lines)
 
     def parse(self, text: str, inp: OrchestrationInput) -> OrchestrationDecision:
-        pool_ids = {it.item_id for it in inp.pool}
-        meta: dict[str, Any] = {"raw": text[:4000], "parse_failure": False}
+        # Shared with the BC data builder and the learned policy so the
+        # decision format has exactly one parser.
+        from .serialize import parse_action
 
-        keep_m = _KEEP_RE.search(text or "")
-        if not keep_m:
-            meta["parse_failure"] = True
-            kept = set(pool_ids)
-        else:
-            body = keep_m.group(1).strip()
-            if body.upper() == "ALL":
-                kept = set(pool_ids)
-            else:
-                tokens = re.findall(r"[A-Za-z0-9_\-]+", body)
-                kept = {t for t in tokens if t in pool_ids}
-                if not kept and pool_ids:
-                    # The model answered but named nothing we know; keep all
-                    # rather than wipe the context.
-                    meta["parse_failure"] = True
-                    kept = set(pool_ids)
-
-        alloc = uniform_allocation(inp.frontier)
-        alloc_m = _ALLOC_RE.search(text or "")
-        if alloc_m:
-            node_ids = {f.node_id for f in inp.frontier}
-            parsed = {k: float(v) for k, v in _PAIR_RE.findall(alloc_m.group(1)) if k in node_ids}
-            if parsed and sum(parsed.values()) > 0:
-                s = sum(parsed.values())
-                alloc = {k: v / s for k, v in parsed.items()}
-                for nid in node_ids - parsed.keys():
-                    alloc[nid] = 0.0
-
-        dec_m = _DECISION_RE.search(text or "")
-        terminate = bool(dec_m and dec_m.group(1).upper() == "TERMINATE")
-
+        parsed = parse_action(
+            text, [it.item_id for it in inp.pool], [f.node_id for f in inp.frontier]
+        )
         return OrchestrationDecision(
-            terminate=terminate, kept_ids=kept, branch_allocation=alloc, meta=meta
+            terminate=parsed.terminate,
+            kept_ids=parsed.kept_ids,
+            branch_allocation=parsed.branch_allocation,
+            meta=parsed.meta,
         )
 
     async def decide(self, inp: OrchestrationInput) -> OrchestrationDecision:
@@ -580,4 +563,24 @@ def build_policy(
         if llm_call is None:
             raise ValueError("prompted policy needs an llm_call")
         return PromptedPolicy(llm_call=llm_call, budget=budget)
+    if name == "random":
+        from .randomized import RandomizedPolicy
+
+        return RandomizedPolicy(
+            seed=_env_int(ENV_SEED),
+            budget=budget,
+            fixed_params=_env_json(ENV_RANDOM_PARAMS),
+        )
     raise ValueError(f"Unknown orchestration policy {name!r}")
+
+
+def _env_json(name: str) -> dict[str, Any] | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    import json
+
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return value
