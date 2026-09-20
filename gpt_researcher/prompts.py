@@ -9,6 +9,21 @@ from .utils.enum import PromptFamily as PromptFamilyEnum
 from typing import Callable, List, Dict, Any
 
 
+# Verbatim from texttron/BrowseComp-Plus search_agent/prompts.py. Default
+# ``--query-template`` for search_agent/openai_client.py. Double braces are
+# literal braces after ``.format(Question=...)``.
+QUERY_TEMPLATE_NO_GET_DOCUMENT = """
+You are a deep research agent. You need to answer the given question by interacting with a search engine, using the search tool provided. Please perform reasoning and use the tool step by step, in an interleaved manner. You may use the search tool multiple times.
+
+Question: {Question}
+
+Your response should be in the following format:
+Explanation: {{your explanation for your final answer. For this explanation section only, you should cite your evidence documents inline by enclosing their docids in square brackets [] at the end of sentences. For example, [20].}}
+Exact Answer: {{your succinct, final answer}}
+Confidence: {{your confidence score between 0% and 100% for your answer}}
+""".strip()
+
+
 ## Prompt Families #############################################################
 
 class PromptFamily:
@@ -413,6 +428,25 @@ The response MUST not contain any markdown format or additional text (like ```js
             " Use appropriate Markdown syntax to format the outline and ensure readability."
             " Consider using markdown tables and other formatting features where they would enhance the presentation of information."
         )
+
+    @staticmethod
+    def generate_browsecomp_answer_prompt(question: str, context, **_kwargs) -> str:
+        """Final answer in the official BrowseComp-Plus format.
+
+        Papers and ``texttron/BrowseComp-Plus`` ``openai_client.py`` wrap the
+        question with ``QUERY_TEMPLATE_NO_GET_DOCUMENT`` as the user message
+        and take the last assistant turn as ``Explanation`` / ``Exact Answer``
+        / ``Confidence``. gpt-researcher searches first, then ``write_report``
+        is that last turn, so the same template is applied here and the
+        gathered documents (search-tool analogue) are appended. The research
+        query itself stays unwrapped so BM25 is not poisoned by the template.
+        """
+        if isinstance(context, list):
+            context = "\n".join(str(c) for c in context)
+        formatted = QUERY_TEMPLATE_NO_GET_DOCUMENT.format(Question=question)
+        if not str(context or "").strip():
+            return formatted
+        return f"{formatted}\n\n{context}"
 
     @staticmethod
     def generate_deep_research_prompt(
@@ -856,6 +890,7 @@ report_type_mapping = {
     ReportType.CustomReport.value: "generate_custom_report_prompt",
     ReportType.SubtopicReport.value: "generate_subtopic_report_prompt",
     ReportType.DeepResearch.value: "generate_deep_research_prompt",
+    ReportType.ShortAnswer.value: "generate_browsecomp_answer_prompt",
 }
 
 
