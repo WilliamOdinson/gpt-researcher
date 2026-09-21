@@ -369,7 +369,9 @@ class LLMLinguaPolicy(OrchestrationPolicy):
                     "GR_ORCHESTRATOR=llmlingua needs the llmlingua package: "
                     "pip install llmlingua (downloads a ~500MB model on first use)"
                 ) from exc
-            self._compressor = PromptCompressor(model_name=self.model_name, use_llmlingua2=True)
+            self._compressor = PromptCompressor(
+                model_name=self.model_name, use_llmlingua2=True, device_map="cpu"
+            )
         return self._compressor
 
     def _compress_one(self, text: str, rate: float) -> str:
