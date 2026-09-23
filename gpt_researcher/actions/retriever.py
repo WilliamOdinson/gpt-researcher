@@ -121,6 +121,11 @@ def get_retriever(retriever: str):
 
             return GetXAPISearch
 
+        case "deepresearchgym":
+            from gpt_researcher.retrievers import DeepResearchGymSearch
+
+            return DeepResearchGymSearch
+
         case _:
             return None
 
