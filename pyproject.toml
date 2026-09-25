@@ -179,9 +179,11 @@ test = [
     "pytest-timeout>=2.3",
     "pytest-forked>=1.6",
 ]
-# GR_ORCHESTRATOR=llmlingua (Table 4 "prompt compression" row).
+# GR_ORCHESTRATOR=llmlingua (Table 4 "prompt compression" row) and
+# GR_ORCHESTRATOR=typesafe (TypeSafe / Jev runtime orchestration).
 orchestration = [
     "llmlingua>=0.2.2",
+    "typesafe-sdk>=0.7.1",
 ]
 requirements-txt = [
     "ag2[openai]>=0.11.2",

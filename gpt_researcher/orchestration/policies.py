@@ -29,7 +29,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-POLICY_NAMES = ("legacy", "none", "topk", "extractive", "llmlingua", "prompted", "random")
+POLICY_NAMES = ("legacy", "none", "topk", "extractive", "llmlingua", "prompted", "random", "typesafe")
 DEFAULT_POLICY = "legacy"
 
 ENV_POLICY = "GR_ORCHESTRATOR"
@@ -572,6 +572,14 @@ def build_policy(
             seed=_env_int(ENV_SEED),
             budget=budget,
             fixed_params=_env_json(ENV_RANDOM_PARAMS),
+        )
+    if name == "typesafe":
+        from .typesafe import ENV_MODEL as ENV_TYPESAFE_MODEL, TypeSafePolicy, thresholds_from_env
+
+        return TypeSafePolicy(
+            budget=budget,
+            model=os.environ.get(ENV_TYPESAFE_MODEL, "").strip() or None,
+            thresholds=thresholds_from_env(),
         )
     raise ValueError(f"Unknown orchestration policy {name!r}")
 
