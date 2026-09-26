@@ -1,4 +1,4 @@
-"""Orchestration policies: the five Table-4 baselines behind one interface.
+"""Orchestration policies: the Table-2 baselines behind one interface.
 
 Every policy implements ``async decide(inp) -> OrchestrationDecision``. The
 deep-research checkpoint builds an ``OrchestrationInput`` from this round's
@@ -29,7 +29,18 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-POLICY_NAMES = ("legacy", "none", "topk", "extractive", "llmlingua", "prompted", "random", "typesafe")
+POLICY_NAMES = (
+    "legacy",
+    "none",
+    "topk",
+    "extractive",
+    "llmlingua",
+    "prompted",
+    "greedy",
+    "heuristic_stop",
+    "random",
+    "typesafe",
+)
 DEFAULT_POLICY = "legacy"
 
 ENV_POLICY = "GR_ORCHESTRATOR"
@@ -41,6 +52,19 @@ ENV_LLMLINGUA_MODEL = "GR_LLMLINGUA_MODEL"
 # optional JSON dict that pins some or all sampled parameters.
 ENV_SEED = "GR_ORCH_SEED"
 ENV_RANDOM_PARAMS = "GR_RANDOM_PARAMS"
+# GreedyMarginalUtilityPolicy: stop adding once the best marginal value falls
+# below GR_GREEDY_MIN_GAIN; GR_GREEDY_LAMBDA is the exponent on the novelty
+# discount (0 disables the redundancy term).
+ENV_GREEDY_MIN_GAIN = "GR_GREEDY_MIN_GAIN"
+ENV_GREEDY_LAMBDA = "GR_GREEDY_LAMBDA"
+# HeuristicStopPolicy: terminate once g_t = Phi(K_t) - Phi(K_{t-1}) has been
+# below GR_STOP_GAIN_THRESHOLD for GR_STOP_PATIENCE consecutive rounds,
+# evaluated from round GR_STOP_MIN_ROUNDS on. GR_STOP_RETAIN=filter keeps the
+# EmbeddingsFilter verdict (default); =all keeps everything.
+ENV_STOP_GAIN_THRESHOLD = "GR_STOP_GAIN_THRESHOLD"
+ENV_STOP_MIN_ROUNDS = "GR_STOP_MIN_ROUNDS"
+ENV_STOP_PATIENCE = "GR_STOP_PATIENCE"
+ENV_STOP_RETAIN = "GR_STOP_RETAIN"
 
 _DEFAULT_LLMLINGUA_MODEL = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
 
@@ -82,6 +106,12 @@ class PoolItem:
     # Chunk-level detail, present only for items first seen this round.
     chunks: list[str] = field(default_factory=list)
     chunk_embeddings: list[list[float]] = field(default_factory=list)
+    # The pipeline's own verdict on a new item: whether any sub-query's
+    # EmbeddingsFilter kept a chunk of this page, and which chunks (aligned
+    # with ``chunks``). ``heuristic_stop`` reproduces the legacy retention
+    # from these; other policies ignore them.
+    filter_kept: bool = True
+    chunk_kept: list[bool] = field(default_factory=list)
 
     @property
     def tokens(self) -> int:
@@ -538,6 +568,11 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _env_int_default(name: str, default: int) -> int:
+    value = _env_int(name)
+    return default if value is None else value
+
+
 def build_policy(
     name: str | None = None,
     *,
@@ -565,6 +600,23 @@ def build_policy(
         if llm_call is None:
             raise ValueError("prompted policy needs an llm_call")
         return PromptedPolicy(llm_call=llm_call, budget=budget)
+    if name == "greedy":
+        from .coverage import GreedyMarginalUtilityPolicy
+
+        return GreedyMarginalUtilityPolicy(
+            budget=budget,
+            min_gain=_env_float(ENV_GREEDY_MIN_GAIN, 0.0),
+            redundancy=_env_float(ENV_GREEDY_LAMBDA, 1.0),
+        )
+    if name == "heuristic_stop":
+        from .coverage import HeuristicStopPolicy
+
+        return HeuristicStopPolicy(
+            threshold=_env_float(ENV_STOP_GAIN_THRESHOLD, 0.01),
+            min_rounds=_env_int_default(ENV_STOP_MIN_ROUNDS, 2),
+            patience=_env_int_default(ENV_STOP_PATIENCE, 1),
+            retain=(os.environ.get(ENV_STOP_RETAIN, "").strip().lower() or "filter"),
+        )
     if name == "random":
         from .randomized import RandomizedPolicy
 

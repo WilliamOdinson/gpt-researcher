@@ -664,7 +664,7 @@ Return ONLY a JSON object using this exact schema:
         # sub-query's filter kept any of its chunks.
         chunk_records = _global_embedding_cache.drain()
         pages: dict[str, dict] = defaultdict(
-            lambda: {"chunks": [], "embs": [], "kept": False, "subquery": None}
+            lambda: {"chunks": [], "embs": [], "chunk_kept": [], "kept": False, "subquery": None}
         )
         for rec in chunk_records:
             for ch in rec["chunks"]:
@@ -673,21 +673,29 @@ Return ONLY a JSON object using this exact schema:
                     p["subquery"] = rec["query"]
                 p["chunks"].append(ch["content"])
                 p["embs"].append(ch["embedding"])
+                p["chunk_kept"].append(bool(ch["kept"]))
                 p["kept"] = p["kept"] or ch["kept"]
 
         # One evidence item per page. Chunks are deduplicated with their
-        # embeddings kept aligned so policies can score at chunk granularity.
+        # embeddings and filter verdicts kept aligned so policies can score
+        # (or reproduce the filter) at chunk granularity. A chunk seen under
+        # several sub-queries is kept if any of them kept it, matching the
+        # page-level ``kept`` rule above.
         page_items: list[dict] = []
         for url, p in pages.items():
-            seen: set[str] = set()
+            seen: dict[str, int] = {}
             unique_chunks: list[str] = []
             unique_embs: list[list[float]] = []
-            for chunk, emb in zip(p["chunks"], p["embs"]):
-                if chunk in seen:
+            unique_kept: list[bool] = []
+            for chunk, emb, kept_flag in zip(p["chunks"], p["embs"], p["chunk_kept"]):
+                idx = seen.get(chunk)
+                if idx is not None:
+                    unique_kept[idx] = unique_kept[idx] or kept_flag
                     continue
-                seen.add(chunk)
+                seen[chunk] = len(unique_chunks)
                 unique_chunks.append(chunk)
                 unique_embs.append(emb)
+                unique_kept.append(kept_flag)
             content = "\n\n".join(unique_chunks)
             item_id = self.trajectory_logger.add_evidence(
                 content=content,
@@ -703,6 +711,7 @@ Return ONLY a JSON object using this exact schema:
                 "content": content,
                 "chunks": unique_chunks,
                 "embs": unique_embs,
+                "chunk_kept": unique_kept,
                 "subquery": p["subquery"],
                 "filter_kept": p["kept"],
             })
@@ -734,6 +743,8 @@ Return ONLY a JSON object using this exact schema:
                     source_subquery=pi["subquery"] or "",
                     chunks=pi["chunks"],
                     chunk_embeddings=pi["embs"],
+                    filter_kept=bool(pi["filter_kept"]),
+                    chunk_kept=pi["chunk_kept"],
                 )
                 for pi in page_items
             ]
