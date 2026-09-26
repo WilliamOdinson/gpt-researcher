@@ -265,3 +265,118 @@ async def test_random_policy_same_seed_same_trajectory(monkeypatch):
         return [(sorted(r.decision.kept_item_ids), r.decision.type, r.decision.meta["child_breadth"]) for r in rounds]
 
     assert await one() == await one()
+
+
+# ------------------------------------------------------------------ heuristic_stop
+
+
+async def test_heuristic_stop_retention_matches_legacy_filter_verdict(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
+    skill = DeepResearchSkill(_researcher(depth=1, breadth=2))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[1.0, 0.0, 0.0]]
+
+    out, _ = await _run(skill, depth=1, breadth=2)
+    snap = skill.trajectory_logger.trajectory.rounds[0]
+    ids = {e.source_url: iid for iid, e in skill.trajectory_logger.get_all_evidence().items()}
+
+    assert snap.decision.policy == "heuristic_stop"
+    # Same verdict as the legacy path: the filter kept A and B, pruned C.
+    assert set(snap.decision.kept_item_ids) == {ids["https://a"], ids["https://b"]}
+    assert set(snap.decision.pruned_item_ids) == {ids["https://c"]}
+    joined = "\n".join(out["context"])
+    assert "Source: https://a" in joined and "Source: https://b" in joined
+    assert "https://c" not in joined
+    # Round 1 < min_rounds (2): the stop rule is not evaluated.
+    assert snap.decision.type == "continue"
+    assert snap.decision.meta["gain"] == pytest.approx(1.0, abs=1e-4)
+    assert snap.decision.branch_allocation == pytest.approx(
+        {make_item_id("goal 1", ""): 0.5, make_item_id("goal 2", ""): 0.5}
+    )
+
+
+async def test_heuristic_stop_terminates_recursion_when_gain_is_low(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
+    monkeypatch.setenv("GR_STOP_GAIN_THRESHOLD", "2.0")  # unreachable: Phi <= 1
+    monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
+    skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[1.0, 0.0, 0.0]]
+
+    out, MockR = await _run(skill, depth=2, breadth=4)
+    snap = skill.trajectory_logger.trajectory.rounds[0]
+    assert snap.decision.type == "terminate"
+    assert snap.decision.meta["terminate_reason"] == "coverage_gain_below_threshold"
+    assert skill.stop_requested is True
+    assert MockR.call_count == 2
+    assert len(skill.trajectory_logger.trajectory.rounds) == 1
+
+
+async def test_heuristic_stop_zero_threshold_never_stops(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
+    monkeypatch.setenv("GR_STOP_GAIN_THRESHOLD", "0.0")
+    monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
+    skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[1.0, 0.0, 0.0]]
+
+    out, MockR = await _run(skill, depth=2, breadth=4)
+    # g_t >= 0 always, so the run explores the full tree like legacy.
+    assert MockR.call_count == 6
+    assert len(skill.trajectory_logger.trajectory.rounds) == 3
+    assert all(r.decision.type == "continue" for r in skill.trajectory_logger.trajectory.rounds)
+
+
+async def test_heuristic_stop_rule_disabled_without_subquestion_embeddings(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
+    monkeypatch.setenv("GR_STOP_GAIN_THRESHOLD", "2.0")
+    monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
+    skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
+    skill.query_embedding = [1.0, 0.0, 0.0]  # no subq_embeddings: plan embedding failed
+
+    out, MockR = await _run(skill, depth=2, breadth=4)
+    assert MockR.call_count == 6
+    assert skill.trajectory_logger.trajectory.rounds[0].decision.meta["stop_enabled"] is False
+
+
+# ------------------------------------------------------------------ greedy
+
+
+async def test_greedy_selects_by_coverage_under_budget(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "greedy")
+    monkeypatch.setenv("GR_CONTEXT_BUDGET_TOKENS", "100")  # two 50-token pages
+    monkeypatch.setenv("GR_GREEDY_LAMBDA", "0")
+    skill = DeepResearchSkill(_researcher(depth=1, breadth=2))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[0.8, 0.6, 0.0]]
+
+    out, _ = await _run(skill, depth=1, breadth=2)
+    snap = skill.trajectory_logger.trajectory.rounds[0]
+    ids = {e.source_url: iid for iid, e in skill.trajectory_logger.get_all_evidence().items()}
+
+    assert snap.decision.policy == "greedy"
+    # C (cos 0.98 to the sub-question) first, then A (0.8) on the residual;
+    # B (0.6) is out of budget even though the filter had kept it, and C is
+    # kept even though the filter had pruned it.
+    assert snap.decision.meta["order"] == [ids["https://c"], ids["https://a"]]
+    assert set(snap.decision.pruned_item_ids) == {ids["https://b"]}
+    assert snap.decision.meta["stop_reason"] == "budget"
+    assert snap.decision.meta["context_tokens_after"] == 100
+    joined = "\n".join(out["context"])
+    assert "Source: https://a" in joined and "Source: https://c" in joined
+    assert "https://b" not in joined
+    retained = {e.source_url for e in skill.trajectory_logger.get_retained_evidence().values()}
+    assert retained == {"https://a", "https://c"}
+    assert "features" in snap.decision.meta and "child_breadth" in snap.decision.meta
+
+
+async def test_greedy_recursion_matches_legacy_effort(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "greedy")
+    skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[1.0, 0.0, 0.0]]
+    out, MockR = await _run(skill, depth=2, breadth=4)
+    assert MockR.call_count == 6
+    for snap in skill.trajectory_logger.trajectory.rounds:
+        assert snap.decision.type == "continue"
+        assert set(snap.decision.meta["child_breadth"].values()) == {2}
