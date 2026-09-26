@@ -29,6 +29,10 @@ Select a policy with the ``GR_ORCHESTRATOR`` environment variable:
                    ratio, scoring weights, allocation concentration and stop
                    rule once per query (``GR_ORCH_SEED``) and logs per-item
                    features into the trajectory
+  typesafe         runtime orchestration with TypeSafe's Jev (System One):
+                   per-item Noul verdicts decide the keep mask in code, and
+                   per-sub-question sufficiency decides termination and the
+                   branch allocation (``TYPESAFE_API_KEY``, ``GR_TYPESAFE_*``)
 
 ``GR_CONTEXT_BUDGET_TOKENS`` (optional) caps the retained evidence per round,
 in approximate tokens (``len(text) // 4``). Used by topk / extractive /
@@ -59,6 +63,7 @@ from .serialize import (  # noqa: F401
     serialize_action,
     serialize_state,
 )
+from .typesafe import TypeSafePolicy, TypeSafeThresholds, thresholds_from_env  # noqa: F401
 from .policies import (  # noqa: F401
     DEFAULT_POLICY,
     ENV_BUDGET as ENV_BUDGET_NAME,
