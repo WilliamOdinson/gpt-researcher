@@ -57,13 +57,15 @@ ENV_RANDOM_PARAMS = "GR_RANDOM_PARAMS"
 # discount (0 disables the redundancy term).
 ENV_GREEDY_MIN_GAIN = "GR_GREEDY_MIN_GAIN"
 ENV_GREEDY_LAMBDA = "GR_GREEDY_LAMBDA"
-# HeuristicStopPolicy: terminate once g_t = Phi(K_t) - Phi(K_{t-1}) has been
-# below GR_STOP_GAIN_THRESHOLD for GR_STOP_PATIENCE consecutive rounds,
+# HeuristicStopPolicy: a frontier branch whose coverage gain over the pool,
+# g_t^(v) = Phi(K_{t-1} u N_v) - Phi(K_{t-1}), is below GR_STOP_PRUNE_GAIN is
+# not expanded further (local). The whole run terminates only once every
+# sub-question is covered with cosine >= GR_STOP_SATISFACTION (1.0 = never),
 # evaluated from round GR_STOP_MIN_ROUNDS on. GR_STOP_RETAIN=filter keeps the
 # EmbeddingsFilter verdict (default); =all keeps everything.
-ENV_STOP_GAIN_THRESHOLD = "GR_STOP_GAIN_THRESHOLD"
+ENV_STOP_PRUNE_GAIN = "GR_STOP_PRUNE_GAIN"
+ENV_STOP_SATISFACTION = "GR_STOP_SATISFACTION"
 ENV_STOP_MIN_ROUNDS = "GR_STOP_MIN_ROUNDS"
-ENV_STOP_PATIENCE = "GR_STOP_PATIENCE"
 ENV_STOP_RETAIN = "GR_STOP_RETAIN"
 
 _DEFAULT_LLMLINGUA_MODEL = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
@@ -112,6 +114,10 @@ class PoolItem:
     # from these; other policies ignore them.
     filter_kept: bool = True
     chunk_kept: list[bool] = field(default_factory=list)
+    # Frontier node (branch) whose sub-researcher retrieved the page; matches
+    # ``FrontierInfo.node_id`` so policies can score each open branch by the
+    # evidence it produced. Empty for items the checkpoint could not attribute.
+    source_node_id: str = ""
 
     @property
     def tokens(self) -> int:
@@ -149,10 +155,13 @@ class OrchestrationInput:
 
 @dataclass
 class OrchestrationDecision:
-    terminate: bool                                  # u
+    terminate: bool                                  # u  (whole run)
     kept_ids: set[str]                               # m  (over new ∪ prev)
     branch_allocation: dict[str, float]              # w  (node_id -> weight)
     rewritten: dict[str, str] = field(default_factory=dict)  # item_id -> new text
+    # Frontier nodes that are not expanded further (their evidence stays in
+    # the pool). Local, per-path termination; independent of ``terminate``.
+    pruned_branches: set[str] = field(default_factory=set)
     meta: dict[str, Any] = field(default_factory=dict)
 
     def text_for(self, item: PoolItem) -> str:
@@ -612,9 +621,9 @@ def build_policy(
         from .coverage import HeuristicStopPolicy
 
         return HeuristicStopPolicy(
-            threshold=_env_float(ENV_STOP_GAIN_THRESHOLD, 0.01),
+            prune_gain=_env_float(ENV_STOP_PRUNE_GAIN, 0.01),
+            satisfaction=_env_float(ENV_STOP_SATISFACTION, 1.0),
             min_rounds=_env_int_default(ENV_STOP_MIN_ROUNDS, 2),
-            patience=_env_int_default(ENV_STOP_PATIENCE, 1),
             retain=(os.environ.get(ENV_STOP_RETAIN, "").strip().lower() or "filter"),
         )
     if name == "random":

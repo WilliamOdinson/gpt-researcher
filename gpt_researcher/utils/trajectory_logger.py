@@ -23,6 +23,9 @@ class EvidenceItem:
     embedding: list[float] | None = None
     source_type: str = "web"
     was_retained: bool = True
+    # Frontier node (branch) whose sub-researcher first retrieved the page;
+    # matches FrontierNode.node_id. Empty when the checkpoint could not tell.
+    source_node_id: str = ""
     # Set when an orchestration policy rewrote (compressed) the content.
     original_word_count: int | None = None
     compressed: bool = False
@@ -149,6 +152,7 @@ class TrajectoryLogger:
         tree_depth: int,
         source_type: str = "web",
         embedding: list[float] | None = None,
+        source_node_id: str = "",
     ) -> str:
         item_id = make_item_id(content, source_url)
         # First insertion wins: tree_depth and retrieval_round must reflect
@@ -165,6 +169,7 @@ class TrajectoryLogger:
             retrieval_round=self._round_counter,
             embedding=embedding,
             source_type=source_type,
+            source_node_id=source_node_id or "",
         )
         return item_id
 
