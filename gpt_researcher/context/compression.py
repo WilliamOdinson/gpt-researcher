@@ -34,6 +34,7 @@ from ..prompts import PromptFamily
 from ..utils.costs import estimate_embedding_cost
 from ..vector_store import VectorStoreWrapper
 from .retriever import SearchAPIRetriever, SectionRetriever
+from ..utils.research_scope import current_branch
 
 _compression_logger = logging.getLogger(__name__)
 
@@ -89,9 +90,9 @@ class _EmbeddingCache:
         self.last_kept_ids = kept_ids
         self.last_pruned_ids = pruned_ids
 
-        self.records.append({
-            "query": query,
-            "chunks": [
+        self.add_record(
+            query,
+            [
                 {
                     "chunk_id": self._chunk_id(c.page_content, c.metadata.get("source", "")),
                     "content": c.page_content,
@@ -102,12 +103,20 @@ class _EmbeddingCache:
                 }
                 for c, emb in zip(all_chunks, chunk_embeddings)
             ],
-        })
+        )
 
         _compression_logger.info(
             f"Embedding cache: {len(kept_ids)} kept, {len(pruned_ids)} pruned "
             f"(threshold={similarity_threshold})"
         )
+
+    def add_record(self, query: str, chunks: list[dict]) -> dict:
+        """Append one sub-query's chunk verdicts, stamped with the frontier
+        branch of the sub-researcher that produced them (``research_scope``)
+        so the checkpoint can attribute the page to that branch."""
+        rec = {"query": query, "chunks": chunks, "branch": current_branch()}
+        self.records.append(rec)
+        return rec
 
     def drain(self) -> list[dict]:
         out = self.records

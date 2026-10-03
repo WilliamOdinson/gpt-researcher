@@ -58,12 +58,14 @@ PAGE_C = ("https://c", [0.9, 0.4359, 0.0], False, "c")
 
 
 def _feed_cache_for(query: str):
-    """Sub-researcher side effect: pretend q1 saw pages A and B, q2 saw page C."""
+    """Sub-researcher side effect: pretend q1 saw pages A and B, q2 saw page C.
+    Goes through add_record like the real ContextCompressor so the record
+    carries the research scope of the sub-researcher's task."""
     if query.endswith("1"):
         chunks = [_chunk(*PAGE_A), _chunk(*PAGE_B)]
     else:
         chunks = [_chunk(*PAGE_C)]
-    _global_embedding_cache.records.append({"query": query, "chunks": chunks})
+    _global_embedding_cache.add_record(query, chunks)
 
 
 async def _run(skill: DeepResearchSkill, depth: int, breadth: int):
@@ -269,6 +271,8 @@ async def test_random_policy_same_seed_same_trajectory(monkeypatch):
 
 # ------------------------------------------------------------------ heuristic_stop
 
+N1, N2 = make_item_id("goal 1", ""), make_item_id("goal 2", "")
+
 
 async def test_heuristic_stop_retention_matches_legacy_filter_verdict(monkeypatch):
     monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
@@ -287,56 +291,96 @@ async def test_heuristic_stop_retention_matches_legacy_filter_verdict(monkeypatc
     joined = "\n".join(out["context"])
     assert "Source: https://a" in joined and "Source: https://b" in joined
     assert "https://c" not in joined
-    # Round 1 < min_rounds (2): the stop rule is not evaluated.
-    assert snap.decision.type == "continue"
+    # Evidence is attributed to the frontier branch that retrieved it.
+    ev = skill.trajectory_logger.get_all_evidence()
+    assert ev[ids["https://a"]].source_node_id == N1
+    assert ev[ids["https://c"]].source_node_id == N2
+    assert snap.decision.meta["branch_items"] == {N1: 2, N2: 0}
     assert snap.decision.meta["gain"] == pytest.approx(1.0, abs=1e-4)
-    assert snap.decision.branch_allocation == pytest.approx(
-        {make_item_id("goal 1", ""): 0.5, make_item_id("goal 2", ""): 0.5}
-    )
 
 
-async def test_heuristic_stop_terminates_recursion_when_gain_is_low(monkeypatch):
+async def test_heuristic_stop_prunes_one_branch_and_expands_the_other(monkeypatch):
     monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
-    monkeypatch.setenv("GR_STOP_GAIN_THRESHOLD", "2.0")  # unreachable: Phi <= 1
-    monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
+    monkeypatch.setenv("GR_STOP_PRUNE_GAIN", "0.01")
     skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
     skill.query_embedding = [1.0, 0.0, 0.0]
     skill.subq_embeddings = [[1.0, 0.0, 0.0]]
 
     out, MockR = await _run(skill, depth=2, breadth=4)
+    rounds = skill.trajectory_logger.trajectory.rounds
+    root = rounds[0]
+    # goal 2's only page (C) was dropped by the filter: zero gain, pruned.
+    # goal 1 (A covers the sub-question) is expanded.
+    assert root.decision.type == "prune"
+    assert root.decision.meta["pruned_branches"] == [N2]
+    assert {fn.node_id: fn.status for fn in root.frontier} == {N1: "open", N2: "pruned"}
+    # Breadth is not spent on the pruned branch: goal 1 keeps its 2 children.
+    assert root.decision.meta["child_breadth"] == {N1: 2}
+    assert root.decision.branch_allocation == pytest.approx({N1: 1.0, N2: 0.0})
+    # 2 root sub-researchers + 2 under goal 1 (nothing under goal 2).
+    assert MockR.call_count == 4
+    assert len(rounds) == 2
+    assert skill.stop_requested is False
+
+
+async def test_heuristic_stop_satisfaction_terminates_the_run(monkeypatch):
+    monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
+    monkeypatch.setenv("GR_STOP_SATISFACTION", "0.95")
+    monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
+    skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
+    skill.query_embedding = [1.0, 0.0, 0.0]
+    skill.subq_embeddings = [[1.0, 0.0, 0.0]]  # A covers it with cos 1.0
+
+    out, MockR = await _run(skill, depth=2, breadth=4)
     snap = skill.trajectory_logger.trajectory.rounds[0]
     assert snap.decision.type == "terminate"
-    assert snap.decision.meta["terminate_reason"] == "coverage_gain_below_threshold"
+    assert snap.decision.meta["terminate_reason"] == "all_subquestions_covered"
     assert skill.stop_requested is True
     assert MockR.call_count == 2
     assert len(skill.trajectory_logger.trajectory.rounds) == 1
 
 
-async def test_heuristic_stop_zero_threshold_never_stops(monkeypatch):
+async def test_heuristic_stop_default_never_terminates_globally(monkeypatch):
     monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
-    monkeypatch.setenv("GR_STOP_GAIN_THRESHOLD", "0.0")
-    monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
+    monkeypatch.setenv("GR_STOP_PRUNE_GAIN", "0.0")  # keep every branch too
     skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
     skill.query_embedding = [1.0, 0.0, 0.0]
     skill.subq_embeddings = [[1.0, 0.0, 0.0]]
 
     out, MockR = await _run(skill, depth=2, breadth=4)
-    # g_t >= 0 always, so the run explores the full tree like legacy.
     assert MockR.call_count == 6
     assert len(skill.trajectory_logger.trajectory.rounds) == 3
     assert all(r.decision.type == "continue" for r in skill.trajectory_logger.trajectory.rounds)
 
 
-async def test_heuristic_stop_rule_disabled_without_subquestion_embeddings(monkeypatch):
+async def test_heuristic_stop_rules_disabled_without_subquestion_embeddings(monkeypatch):
     monkeypatch.setenv("GR_ORCHESTRATOR", "heuristic_stop")
-    monkeypatch.setenv("GR_STOP_GAIN_THRESHOLD", "2.0")
+    monkeypatch.setenv("GR_STOP_SATISFACTION", "0.1")
     monkeypatch.setenv("GR_STOP_MIN_ROUNDS", "1")
     skill = DeepResearchSkill(_researcher(depth=2, breadth=4))
     skill.query_embedding = [1.0, 0.0, 0.0]  # no subq_embeddings: plan embedding failed
 
     out, MockR = await _run(skill, depth=2, breadth=4)
     assert MockR.call_count == 6
-    assert skill.trajectory_logger.trajectory.rounds[0].decision.meta["stop_enabled"] is False
+    meta = skill.trajectory_logger.trajectory.rounds[0].decision.meta
+    assert meta["stop_enabled"] is False and meta["prune_disabled_reason"] == "no_embeddings"
+
+
+# ------------------------------------------------------------------ attribution
+
+
+def test_embedding_cache_records_carry_the_branch():
+    from gpt_researcher.utils.research_scope import branch_scope, current_branch
+
+    _global_embedding_cache.records = []
+    with branch_scope("b1"):
+        assert current_branch() == "b1"
+        rec = _global_embedding_cache.add_record("q", [])
+    assert current_branch() is None
+    unscoped = _global_embedding_cache.add_record("q2", [])
+    assert rec["branch"] == "b1" and unscoped["branch"] is None
+    assert _global_embedding_cache.drain() == [rec, unscoped]
+    assert _global_embedding_cache.records == []
 
 
 # ------------------------------------------------------------------ greedy

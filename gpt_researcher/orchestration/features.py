@@ -102,6 +102,7 @@ class ItemRow:
     retrieval_round: int
     is_new: bool
     source_subquery: str = ""
+    source_node_id: str = ""
 
 
 @dataclass
@@ -134,6 +135,14 @@ class FeatureBundle:
             "tau": self.tau,
             "tau_c": self.tau_c,
         }
+
+
+def item_from_branch(item: ItemRow, node_id: str, subquery: str) -> bool:
+    """Was ``item`` retrieved by the frontier branch ``node_id``? Prefers the
+    checkpoint's node attribution and falls back to the sub-query string."""
+    if item.source_node_id:
+        return item.source_node_id == node_id
+    return bool(item.source_subquery) and item.source_subquery == subquery
 
 
 def coverage_potential(item_vectors: np.ndarray, have: np.ndarray, subq: np.ndarray, subq_have: np.ndarray) -> float:
@@ -255,7 +264,7 @@ def compute_features(
             gap = 1.0 - float(np.max(mat[retained_mask] @ fr[j]))
         elif fr_have[j] and have.any():
             gap = 1.0 - float(np.max(mat[have] @ fr[j]))
-        n_items = sum(1 for it in items if it.source_subquery and it.source_subquery == f.subquery)
+        n_items = sum(1 for it in items if item_from_branch(it, f.node_id, f.subquery))
         frontier_stats[f.node_id] = {"gap": float(np.clip(gap, 0.0, 1.0)), "n_items": float(n_items)}
 
     phi_prev = coverage_potential(mat[prev_mask], have[prev_mask], sq, sq_have) if prev_mask.any() else 0.0

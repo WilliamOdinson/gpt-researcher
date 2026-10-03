@@ -13,6 +13,7 @@ import numpy as np
 from gpt_researcher.llm_provider.generic.base import ReasoningEfforts
 from ..utils.latency_tracker import LatencyTracker
 from ..utils.llm import create_chat_completion
+from ..utils.research_scope import branch_scope
 from ..utils.enum import ReportType, ReportSource, Tone
 from ..utils.scraper_cache import _global_scraper_cache
 from ..utils.search_cache import _global_search_cache
@@ -535,6 +536,12 @@ Return ONLY a JSON object using this exact schema:
         semaphore = asyncio.Semaphore(self.concurrency_limit)
 
         async def process_query(serp_query: Dict[str, str]) -> Optional[Dict[str, Any]]:
+            # The branch id is the frontier node this sub-query becomes; every
+            # chunk its sub-researcher records is attributed to it.
+            with branch_scope(make_item_id(serp_query['researchGoal'], '')):
+                return await process_branch(serp_query)
+
+        async def process_branch(serp_query: Dict[str, str]) -> Optional[Dict[str, Any]]:
             async with semaphore:
                 try:
                     progress.current_query = serp_query['query']
@@ -664,13 +671,15 @@ Return ONLY a JSON object using this exact schema:
         # sub-query's filter kept any of its chunks.
         chunk_records = _global_embedding_cache.drain()
         pages: dict[str, dict] = defaultdict(
-            lambda: {"chunks": [], "embs": [], "chunk_kept": [], "kept": False, "subquery": None}
+            lambda: {"chunks": [], "embs": [], "chunk_kept": [], "kept": False, "subquery": None, "branch": None}
         )
         for rec in chunk_records:
             for ch in rec["chunks"]:
                 p = pages[ch["source_url"]]
                 if p["subquery"] is None:
                     p["subquery"] = rec["query"]
+                if p["branch"] is None:
+                    p["branch"] = rec.get("branch")
                 p["chunks"].append(ch["content"])
                 p["embs"].append(ch["embedding"])
                 p["chunk_kept"].append(bool(ch["kept"]))
@@ -704,6 +713,7 @@ Return ONLY a JSON object using this exact schema:
                 tree_depth=current_tree_depth,
                 source_type="page",
                 embedding=_unit_mean(unique_embs) if unique_embs else None,
+                source_node_id=p["branch"] or "",
             )
             page_items.append({
                 "item_id": item_id,
@@ -713,6 +723,7 @@ Return ONLY a JSON object using this exact schema:
                 "embs": unique_embs,
                 "chunk_kept": unique_kept,
                 "subquery": p["subquery"],
+                "branch": p["branch"] or "",
                 "filter_kept": p["kept"],
             })
 
@@ -724,6 +735,8 @@ Return ONLY a JSON object using this exact schema:
         result_node_ids = [make_item_id(r['researchGoal'], '') for r in results]
         default_child_breadth = max(2, breadth // 2)
         child_breadth: dict[str, int] = {nid: default_child_breadth for nid in result_node_ids}
+        # Frontier nodes a policy chose not to expand (local termination).
+        pruned_branches: set[str] = set()
 
         if self.orchestrator is None:
             # Legacy: record the EmbeddingsFilter's verdict, change nothing.
@@ -745,6 +758,7 @@ Return ONLY a JSON object using this exact schema:
                     chunk_embeddings=pi["embs"],
                     filter_kept=bool(pi["filter_kept"]),
                     chunk_kept=pi["chunk_kept"],
+                    source_node_id=pi["branch"],
                 )
                 for pi in page_items
             ]
@@ -758,6 +772,7 @@ Return ONLY a JSON object using this exact schema:
                     retrieval_round=e.retrieval_round,
                     is_new=False,
                     source_subquery=e.source_subquery,
+                    source_node_id=e.source_node_id,
                 )
                 for e in self.trajectory_logger.get_retained_evidence().values()
                 if e.item_id not in new_ids
@@ -804,12 +819,23 @@ Return ONLY a JSON object using this exact schema:
             # u: stop every pending recursion once any round says terminate.
             if decision.terminate:
                 self.stop_requested = True
-            decision_type = "terminate" if decision.terminate else "continue"
 
-            # w: split the same total child breadth the fork would have spent.
+            # Local termination: pruned frontier nodes keep their evidence in
+            # the pool but are not expanded; their breadth is not spent.
+            pruned_branches = set(decision.pruned_branches) & set(result_node_ids)
+            for fn in frontier_nodes:
+                if fn.node_id in pruned_branches:
+                    fn.status = "pruned"
+            decision_type = (
+                "terminate" if decision.terminate else ("prune" if pruned_branches else "continue")
+            )
+
+            # w: split the same total child breadth the fork would have spent
+            # across the branches that are still expanded.
             branch_allocation = dict(decision.branch_allocation)
+            expand_ids = [nid for nid in result_node_ids if nid not in pruned_branches]
             child_breadth = allocate_breadth(
-                branch_allocation, result_node_ids, default_child_breadth * len(result_node_ids)
+                branch_allocation, expand_ids, default_child_breadth * len(expand_ids)
             )
 
             decision_meta = dict(decision.meta)
@@ -818,6 +844,8 @@ Return ONLY a JSON object using this exact schema:
                 estimate_tokens(decision.text_for(it)) for it in inp.pool if it.item_id in decision.kept_ids
             )
             decision_meta["child_breadth"] = child_breadth
+            if pruned_branches:
+                decision_meta["pruned_branches"] = sorted(pruned_branches)
 
         tokens_after = TokenTracker.snapshot()
         latency_counts_after = LatencyTracker.snapshot()
@@ -851,13 +879,14 @@ Return ONLY a JSON object using this exact schema:
         logger.info(
             f"Round {round_id} checkpoint [{self.policy_name}]: depth={depth}, "
             f"kept={len(kept_ids)}, pruned={len(pruned_ids)}, "
-            f"frontier_nodes={len(frontier_nodes)}, decision={decision_type}, "
-            f"child_breadth={child_breadth}"
+            f"frontier_nodes={len(frontier_nodes)}, pruned_branches={len(pruned_branches)}, "
+            f"decision={decision_type}, child_breadth={child_breadth}"
         )
 
         for result, node_id in zip(results, result_node_ids):
-            # Continue deeper if needed, unless a policy asked to stop.
-            if depth > 1 and not self.stop_requested:
+            # Continue deeper if needed, unless a policy asked to stop or the
+            # policy pruned this branch.
+            if depth > 1 and not self.stop_requested and node_id not in pruned_branches:
                 new_breadth = child_breadth.get(node_id, default_child_breadth)
                 new_depth = depth - 1
                 progress.current_depth += 1

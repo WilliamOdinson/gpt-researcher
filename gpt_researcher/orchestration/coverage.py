@@ -38,21 +38,25 @@ HeuristicStopPolicy
     Retention is the pipeline default: the per-sub-query EmbeddingsFilter
     verdict that ``GR_ORCHESTRATOR=legacy`` records, applied at chunk
     granularity (a kept page is trimmed to the chunks the filter kept).
-    Previously retained items always survive. The policy only decides u:
-    after ``min_rounds`` rounds it terminates once the coverage gain
+    Previously retained items always survive. Termination follows the
+    ParallelResearch split between pruning a path and stopping the run:
 
-        g_t = Phi(K_t) - Phi(K_{t-1})
+      local   a frontier branch v whose coverage gain over the pool that
+              existed before the round, g_t^(v) = Phi(K_{t-1} u N_v) -
+              Phi(K_{t-1}), is below ``prune_gain`` is not expanded further
+              (``pruned_branches``); its evidence stays in the shared pool and
+              sibling subtrees are unaffected
+      global  the run terminates only once every sub-question is covered,
+              min_k max_{c in K_t} cos(e(c), e(q^(k))) >= ``satisfaction``,
+              from ``min_rounds`` on; 1.0 (the default) never terminates
 
-    has stayed below ``threshold`` for ``patience`` consecutive rounds.
     ``retain="all"`` keeps every item instead (the ``none`` row plus the
-    stopping rule), which isolates the effect of termination in Table 2.
-    Uniform branch allocation.
+    pruning rule), which isolates the effect of termination in Table 2.
+    Uniform allocation over the branches still expanded.
 
-Caveat for tuning ``heuristic_stop``: the fork expands the research tree
-depth-first and a round is one node's children finishing, so consecutive
-rounds are often narrow leaf sub-trees whose gain is exactly zero. A
-``patience`` of 1 will then stop before sibling top-level branches have run
-at all; sweep ``patience`` together with ``threshold``.
+Subtrees are expanded depth-first and serially, so a round is one node's
+children finishing; the local rule is what makes that safe: a low-gain leaf
+under branch 1 stops only its own path, and branches 2..n are still searched.
 """
 
 from __future__ import annotations
@@ -69,6 +73,7 @@ from .features import (
     _unit_matrix,
     compute_features,
     coverage_potential_for,
+    item_from_branch,
 )
 from .policies import (
     OrchestrationDecision,
@@ -95,6 +100,7 @@ def _rows(items: list[PoolItem]) -> list[ItemRow]:
             retrieval_round=it.retrieval_round,
             is_new=it.is_new,
             source_subquery=it.source_subquery or "",
+            source_node_id=getattr(it, "source_node_id", "") or "",
         )
         for it in items
     ]
@@ -273,31 +279,58 @@ class GreedyMarginalUtilityPolicy(OrchestrationPolicy):
 
 
 class HeuristicStopPolicy(OrchestrationPolicy):
-    """Row "Heuristic stopping": default retention, terminate when the
-    per-round coverage gain g_t = Phi(K_t) - Phi(K_{t-1}) stays below
-    ``threshold`` for ``patience`` consecutive rounds (evaluated from round
-    ``min_rounds`` on)."""
+    """Row "Heuristic stopping": default retention; per-branch pruning on the
+    branch's coverage gain; global termination only on goal satisfaction.
+
+    Local (u for one path). For every frontier node v with kept new items
+    N_v, the gain of having searched it is
+
+        g_t^(v) = Phi(K_{t-1} u N_v) - Phi(K_{t-1}),
+
+    the coverage it added to the pool that existed before this round.
+    Branches with g_t^(v) < ``prune_gain`` are returned in
+    ``pruned_branches`` and the checkpoint does not expand them; their
+    evidence stays in the pool and nothing else in the tree is affected.
+    The gain is measured against K_{t-1} rather than against the siblings'
+    items so that two branches returning the same pages are not both
+    discarded (redundancy is the keep mask's job), and at the root
+    K_0 = {} so no top-level branch is pruned before it has been searched.
+
+    Global (u for the run). Terminate once every sub-question is covered:
+    min_k max_{c in K_t} cos(e(c), e(q^(k))) >= ``satisfaction``, evaluated
+    from round ``min_rounds`` on. 1.0 disables it, which is the default:
+    with the serial depth-first recursion a global stop fires before
+    sibling subtrees have been searched unless the threshold is calibrated
+    for the embedding model, so the row prunes locally only unless the
+    threshold is set deliberately.
+
+    Both decisions are disabled for a round in which the policy cannot
+    compute them (no sub-question or evidence embeddings; no branch
+    attribution on the new items), and the reason is written to ``meta``.
+    """
 
     name = "heuristic_stop"
     needs_embeddings = True
 
     def __init__(
         self,
-        threshold: float = 0.01,
+        prune_gain: float = 0.01,
+        satisfaction: float = 1.0,
         min_rounds: int = 2,
-        patience: int = 1,
         retain: str = "filter",
     ) -> None:
         if retain not in STOP_RETAIN_MODES:
             raise ValueError(f"retain must be one of {STOP_RETAIN_MODES}, got {retain!r}")
-        self.threshold = float(threshold)
+        if prune_gain < 0.0:
+            raise ValueError(f"prune_gain must be >= 0, got {prune_gain}")
+        if not 0.0 < satisfaction <= 1.0:
+            raise ValueError(f"satisfaction must be in (0, 1], got {satisfaction}")
+        self.prune_gain = float(prune_gain)
+        self.satisfaction = float(satisfaction)
         self.min_rounds = max(1, int(min_rounds))
-        self.patience = max(1, int(patience))
         self.retain = retain
-        # Consecutive rounds (from min_rounds on) with g_t < threshold.
-        self.low_streak = 0
-        # (round_id, phi_prev, phi_after, gain) per decision, for analysis.
-        self.history: list[tuple[int, float, float, float]] = []
+        # (round_id, phi_prev, phi_after, min_cov, pruned) per decision.
+        self.history: list[tuple[int, float, float, float, list[str]]] = []
 
     @staticmethod
     def _filter_text(item: PoolItem) -> str | None:
@@ -308,6 +341,23 @@ class HeuristicStopPolicy(OrchestrationPolicy):
         if all(item.chunk_kept) or not any(item.chunk_kept):
             return None
         return "\n\n".join(c for c, k in zip(item.chunks, item.chunk_kept) if k)
+
+    @staticmethod
+    def _min_coverage(kept: set[str], rows: list[ItemRow], subq: list[list[float]]) -> float:
+        """min over sub-questions of the best retained cosine (the strict
+        form of Phi, which averages it)."""
+        chosen = [it for it in rows if it.item_id in kept]
+        if not chosen or not subq:
+            return 0.0
+        dim = _dim_of(chosen, subq)
+        mat, have = _unit_matrix([it.embedding for it in chosen], dim)
+        sq, sq_have = _unit_matrix(list(subq), dim)
+        if not have.any() or not sq_have.any():
+            return 0.0
+        best = np.max(mat[have] @ sq[sq_have].T, axis=0)  # (M_have,)
+        if sq_have.sum() < len(subq):
+            return 0.0  # a sub-question without a vector cannot be satisfied
+        return float(np.min(best))
 
     async def decide(self, inp: OrchestrationInput) -> OrchestrationDecision:
         pool = inp.pool
@@ -330,41 +380,77 @@ class HeuristicStopPolicy(OrchestrationPolicy):
             else:
                 n_filter_pruned += 1
 
-        # u: coverage gain of this round's retained set over K_{t-1}.
+        prev_ids = {it.item_id for it in inp.retained_prev}
         phi_prev = float(bundle.phi_prev)
         phi_after = float(coverage_potential_for(kept, rows, inp.subquestion_embeddings))
-        gain = phi_after - phi_prev
-        self.history.append((inp.round_id, phi_prev, phi_after, gain))
+        have_vectors = bool(inp.subquestion_embeddings) and any(it.embedding for it in pool)
 
-        stop_enabled = bool(inp.subquestion_embeddings) and any(it.embedding for it in pool)
+        # Local: prune frontier branches whose kept items added nothing.
+        row_by_id = {r.item_id: r for r in rows}
+        branch_items: dict[str, set[str]] = {}
+        for f in inp.frontier:
+            branch_items[f.node_id] = {
+                it.item_id
+                for it in inp.new_items
+                if it.item_id in kept and item_from_branch(row_by_id[it.item_id], f.node_id, f.subquery)
+            }
+        attributed = sum(len(v) for v in branch_items.values())
+        branch_gain: dict[str, float] = {}
+        pruned: set[str] = set()
+        prune_disabled = ""
+        if not inp.frontier:
+            prune_disabled = "no_frontier"
+        elif not have_vectors:
+            prune_disabled = "no_embeddings"
+        elif attributed == 0 and any(it.item_id in kept for it in inp.new_items):
+            # Kept pages exist but none can be tied to a branch: pruning on
+            # gains of zero would discard every path, so skip the round.
+            prune_disabled = "no_branch_attribution"
+        else:
+            for f in inp.frontier:
+                with_branch = coverage_potential_for(prev_ids | branch_items[f.node_id], rows, inp.subquestion_embeddings)
+                gain = float(with_branch) - phi_prev
+                branch_gain[f.node_id] = gain
+                if gain < self.prune_gain:
+                    pruned.add(f.node_id)
+
+        # Global: only when every sub-question is covered.
+        min_cov = self._min_coverage(kept, rows, inp.subquestion_embeddings) if have_vectors else 0.0
         terminate = False
         reason = ""
-        if not stop_enabled:
+        if not have_vectors:
             reason = "stop_disabled_no_embeddings"
             logger.warning(
                 "heuristic_stop: no sub-question or evidence embeddings at round %s; "
-                "the stopping rule is disabled for this round",
+                "pruning and termination are disabled for this round",
                 inp.round_id,
             )
-        elif inp.round_id >= self.min_rounds:
-            if gain < self.threshold:
-                self.low_streak += 1
-            else:
-                self.low_streak = 0
-            if self.low_streak >= self.patience:
-                terminate = True
-                reason = "coverage_gain_below_threshold"
+        elif self.satisfaction < 1.0 and inp.round_id >= self.min_rounds and min_cov >= self.satisfaction:
+            terminate = True
+            reason = "all_subquestions_covered"
+
+        self.history.append((inp.round_id, phi_prev, phi_after, min_cov, sorted(pruned)))
+
+        # w: uniform over the branches that are still expanded.
+        surviving = [f for f in inp.frontier if f.node_id not in pruned]
+        allocation = uniform_allocation(surviving)
+        for f in inp.frontier:
+            allocation.setdefault(f.node_id, 0.0)
 
         meta: dict[str, Any] = {
             "policy": self.name,
             "retain": self.retain,
-            "threshold": self.threshold,
+            "prune_gain": self.prune_gain,
+            "satisfaction": self.satisfaction,
             "min_rounds": self.min_rounds,
-            "patience": self.patience,
             "phi_after": round(phi_after, 4),
-            "gain": round(gain, 5),
-            "low_streak": self.low_streak,
-            "stop_enabled": stop_enabled,
+            "gain": round(phi_after - phi_prev, 5),
+            "min_coverage": round(float(min_cov), 4),
+            "branch_gain": {k: round(v, 5) for k, v in branch_gain.items()},
+            "branch_items": {k: len(v) for k, v in branch_items.items()},
+            "pruned_branches": sorted(pruned),
+            "prune_disabled_reason": prune_disabled,
+            "stop_enabled": have_vectors and self.satisfaction < 1.0,
             "terminate_reason": reason,
             "n_pool": len(pool),
             "n_new": len(inp.new_items),
@@ -379,7 +465,8 @@ class HeuristicStopPolicy(OrchestrationPolicy):
         return OrchestrationDecision(
             terminate=terminate,
             kept_ids=kept,
-            branch_allocation=uniform_allocation(inp.frontier),
+            branch_allocation=allocation,
             rewritten=rewritten,
+            pruned_branches=pruned,
             meta=meta,
         )
