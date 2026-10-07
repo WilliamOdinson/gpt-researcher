@@ -45,6 +45,14 @@ def _unit_mean(vectors: list[list[float]]) -> list[float]:
 # Maximum words allowed in context (25k words for safety margin)
 MAX_CONTEXT_WORDS = 25000
 
+# Branch replay (opt-in). GR_NODE_CACHE=1 records every sub-query node's
+# research output and cost in the trajectory (Trajectory.nodes) so a report can
+# be re-synthesized from any sub-tree. GR_BRANCH_INDEPENDENT=1 gives each
+# branch its own visited-URL set, so a branch's output does not depend on which
+# siblings ran before it and sub-tree replay is exact.
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
 JSON_BLOCK_PATTERNS = [
     re.compile(
         r"```(?:json)?\s*(?P<payload>[\s\S]*?)```",
@@ -258,6 +266,18 @@ def trim_context_to_word_limit(context_list: List[str], max_words: int = MAX_CON
 
     return trimmed_context
 
+def pack_context_head(context_list: List[str], max_words: int = MAX_CONTEXT_WORDS) -> List[str]:
+    """Fill the word budget from the front of the list, keeping order and
+    skipping items that would overflow it (learnings come first, so they
+    always reach the writer)."""
+    packed, total = [], 0
+    for item in context_list:
+        words = count_words(item)
+        if total + words <= max_words:
+            packed.append(item)
+            total += words
+    return packed
+
 class ResearchProgress:
     def __init__(self, total_depth: int, total_breadth: int):
         self.current_depth = 1  # Start from 1 and increment up to total_depth
@@ -291,6 +311,11 @@ class DeepResearchSkill:
         # on the policy's (u, m, w).
         self.policy_name = policy_name_from_env()
         self.orchestrator = build_policy(self.policy_name, llm_call=self._orchestrator_llm_call)
+        self.expansion = None
+        if self.policy_name == "replaygym":
+            from ..orchestration.replaygym import ExpansionPolicy
+
+            self.expansion = ExpansionPolicy.from_env()
         raw_budget = os.environ.get(ENV_BUDGET_NAME, "").strip()
         self.token_budget: int | None = int(raw_budget) if raw_budget else None
         self.query_embedding: list[float] | None = None
@@ -328,6 +353,25 @@ class DeepResearchSkill:
             key=lambda e: (e.retrieval_round, e.tree_depth),
         )
         return [self._format_item(e.source_url, e.content) for e in items]
+
+    def _retained_context_balanced(self) -> List[str]:
+        """K_T interleaved round-robin across the search sub-queries that
+        produced it (each in retrieval order), so a front-filled writer budget
+        reaches every sub-question instead of only the first or last ones."""
+        items = sorted(
+            self.trajectory_logger.get_retained_evidence().values(),
+            key=lambda e: (e.retrieval_round, e.tree_depth),
+        )
+        groups: dict[str, list] = {}
+        for e in items:
+            groups.setdefault(e.source_subquery or "", []).append(e)
+        queues = list(groups.values())
+        ordered = []
+        while any(queues):
+            for q in queues:
+                if q:
+                    ordered.append(q.pop(0))
+        return [self._format_item(e.source_url, e.content) for e in ordered]
 
     async def _embed_query_and_subquestions(self, subquestions: List[str]) -> None:
         """Embed the root query and sub-questions once so policies can score
@@ -490,7 +534,8 @@ Return ONLY a JSON object using this exact schema:
             learnings: List[str] = None,
             citations: Dict[str, str] = None,
             visited_urls: Set[str] = None,
-            on_progress=None
+            on_progress=None,
+            parent_node_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Conduct deep iterative research"""
         print(f"\n📊 DEEP RESEARCH: depth={depth}, breadth={breadth}, query={query[:100]}...", flush=True)
@@ -542,6 +587,9 @@ Return ONLY a JSON object using this exact schema:
                         on_progress(progress)
 
                     from .. import GPTResearcher
+                    _tok0 = TokenTracker.snapshot()
+                    _lat0 = LatencyTracker.snapshot()
+                    _t0 = time.time()
                     researcher = GPTResearcher(
                         query=serp_query['query'],
                         report_type=ReportType.ResearchReport.value,
@@ -550,7 +598,7 @@ Return ONLY a JSON object using this exact schema:
                         websocket=self.websocket,
                         config_path=self.config_path,
                         headers=self.headers,
-                        visited_urls=self.visited_urls,
+                        visited_urls=set() if _env_flag("GR_BRANCH_INDEPENDENT") else self.visited_urls,
                         # Propagate MCP configuration to nested researchers
                         mcp_configs=self.researcher.mcp_configs,
                         mcp_strategy=self.researcher.mcp_strategy
@@ -575,7 +623,16 @@ Return ONLY a JSON object using this exact schema:
                     if on_progress:
                         on_progress(progress)
 
+                    _tok1 = TokenTracker.snapshot()
+                    _lat1 = LatencyTracker.snapshot()
                     return {
+                        '_query': serp_query['query'],
+                        '_cost': {
+                            'tokens_input': _tok1["input_tokens"] - _tok0["input_tokens"],
+                            'tokens_output': _tok1["output_tokens"] - _tok0["output_tokens"],
+                            'llm_calls': _lat1.get("llm", 0) - _lat0.get("llm", 0),
+                            'latency_seconds': time.time() - _t0,
+                        },
                         'learnings': results['learnings'],
                         'visited_urls': list(visited),
                         'followUpQuestions': results['followUpQuestions'],
@@ -648,6 +705,22 @@ Return ONLY a JSON object using this exact schema:
                 all_sources.extend(result['sources'])
 
             node_id = make_item_id(result['researchGoal'], '')
+            result['_node_id'] = node_id
+            if _env_flag("GR_NODE_CACHE"):
+                ctx = result['context']
+                self.trajectory_logger.trajectory.nodes.append({
+                    'node_id': node_id,
+                    'parent_node_id': parent_node_id,
+                    'tree_depth': current_tree_depth,
+                    'query': result.get('_query', ''),
+                    'research_goal': result['researchGoal'],
+                    'follow_up_questions': list(result['followUpQuestions']),
+                    'learnings': list(result['learnings']),
+                    'citations': dict(result['citations']),
+                    'context': ctx if isinstance(ctx, str) else "\n".join(map(str, ctx or [])),
+                    'cost': result.get('_cost', {}),
+                    'concurrency': self.concurrency_limit,
+                })
             frontier_nodes.append(FrontierNode(
                 node_id=node_id,
                 subquery=result['researchGoal'],
@@ -819,6 +892,25 @@ Return ONLY a JSON object using this exact schema:
             )
             decision_meta["child_breadth"] = child_breadth
 
+            if self.expansion is not None:
+                from ..orchestration.replaygym import full_tree_size
+
+                if self.expansion.query_vec is None:
+                    self.expansion.set_query(self.researcher.query)
+                self.expansion.observe(
+                    result_node_ids,
+                    [r['researchGoal'] for r in results],
+                    [r['learnings'] for r in results],
+                )
+                if depth > 1:
+                    skip, exp_log = self.expansion.decide(
+                        result_node_ids, current_tree_depth, full_tree_size(self.breadth, self.depth)
+                    )
+                    for nid in skip:
+                        child_breadth[nid] = 0
+                    decision_meta["expansion"] = exp_log
+                    decision_meta["child_breadth"] = child_breadth
+
         tokens_after = TokenTracker.snapshot()
         latency_counts_after = LatencyTracker.snapshot()
         round_search_calls = (
@@ -859,6 +951,8 @@ Return ONLY a JSON object using this exact schema:
             # Continue deeper if needed, unless a policy asked to stop.
             if depth > 1 and not self.stop_requested:
                 new_breadth = child_breadth.get(node_id, default_child_breadth)
+                if new_breadth <= 0:  # a policy chose not to expand this branch
+                    continue
                 new_depth = depth - 1
                 progress.current_depth += 1
 
@@ -876,7 +970,8 @@ Return ONLY a JSON object using this exact schema:
                     learnings=all_learnings,
                     citations=all_citations,
                     visited_urls=all_visited_urls,
-                    on_progress=on_progress
+                    on_progress=on_progress,
+                    parent_node_id=node_id,
                 )
 
                 all_learnings = deeper_results['learnings']
@@ -945,8 +1040,11 @@ Return ONLY a JSON object using this exact schema:
         # With a policy active the final evidence context is the retained set
         # K_T as decided round by round (including supersession of earlier
         # items and any compression), not the per-level lists.
+        pack_mode = os.environ.get("GR_FINAL_PACK", "tail").strip().lower()
         if self.orchestrator is not None:
-            results['context'] = self._retained_context()
+            results['context'] = (
+                self._retained_context_balanced() if pack_mode == "balanced" else self._retained_context()
+            )
 
         # Prepare context with citations
         context_with_citations = []
@@ -961,8 +1059,13 @@ Return ONLY a JSON object using this exact schema:
         if results.get('context'):
             context_with_citations.extend(results['context'])
 
-        # Trim final context to word limit
-        final_context = trim_context_to_word_limit(context_with_citations)
+        # Trim final context to word limit. GR_FINAL_PACK=head keeps the
+        # distilled learnings and the earliest evidence (fill from the front,
+        # skip what does not fit); the default keeps the tail, as upstream.
+        if pack_mode in ("head", "balanced"):
+            final_context = pack_context_head(context_with_citations)
+        else:
+            final_context = trim_context_to_word_limit(context_with_citations)
 
         # Set enhanced context and visited URLs
         self.researcher.context = "\n".join(

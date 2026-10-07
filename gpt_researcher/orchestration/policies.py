@@ -40,6 +40,7 @@ POLICY_NAMES = (
     "heuristic_stop",
     "random",
     "typesafe",
+    "replaygym",
 )
 DEFAULT_POLICY = "legacy"
 
@@ -588,6 +589,14 @@ def build_policy(
 
     if name == "legacy":
         return None
+    if name == "replaygym":
+        # The learned expansion decisions are applied at the checkpoint
+        # (orchestration/replaygym.py). Evidence handling defaults to "none";
+        # GR_REPLAYGYM_EVIDENCE=<policy> composes it with another row's rule.
+        evidence = os.environ.get("GR_REPLAYGYM_EVIDENCE", "none").strip().lower() or "none"
+        if evidence in ("none", "replaygym", "legacy"):
+            return NoPruningPolicy()
+        return build_policy(evidence, llm_call=llm_call, budget=budget)
     if name == "none":
         return NoPruningPolicy()
     if name == "topk":

@@ -104,6 +104,10 @@ class Trajectory:
     fraction_pruned: float = 0.0
     orchestration_steps: int = 0
     evidence_items_per_trajectory: int = 0
+    # Per-branch research outputs (GR_NODE_CACHE=1): one dict per sub-query
+    # node with its parent, learnings, citations, context and cost, so a report
+    # can be re-synthesized from any sub-tree without re-running research.
+    nodes: list[dict] = field(default_factory=list)
 
 
 def _content_hash(content: str) -> str:
