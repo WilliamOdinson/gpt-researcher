@@ -53,6 +53,14 @@ MAX_CONTEXT_WORDS = 25000
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
 
+
+def unique_in_order(items: List[str]) -> List[str]:
+    """Drop repeats, keeping first occurrence order. ``list(set(...))`` ordered
+    the learnings by string hash, which changes with every process, so the
+    writer saw them in a different order on each run and a replayed sub-tree
+    could never reproduce the live writer input."""
+    return list(dict.fromkeys(items))
+
 JSON_BLOCK_PATTERNS = [
     re.compile(
         r"```(?:json)?\s*(?P<payload>[\s\S]*?)```",
@@ -994,7 +1002,7 @@ Return ONLY a JSON object using this exact schema:
         logger.info(f"Trimmed context from {len(all_context)} items to {len(trimmed_context)} items to stay within word limit")
 
         return {
-            'learnings': list(set(all_learnings)),
+            'learnings': unique_in_order(all_learnings),
             'visited_urls': list(all_visited_urls),
             'citations': all_citations,
             'context': trimmed_context,
