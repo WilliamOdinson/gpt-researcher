@@ -892,24 +892,27 @@ Return ONLY a JSON object using this exact schema:
             )
             decision_meta["child_breadth"] = child_breadth
 
-            if self.expansion is not None:
-                from ..orchestration.replaygym import full_tree_size
+        # Learned expansion (GR_ORCHESTRATOR=replaygym) runs on both evidence
+        # paths; by default the orchestrator is None (legacy evidence), which
+        # is the writer input ReplayGym trained the policy on.
+        if self.expansion is not None:
+            from ..orchestration.replaygym import full_tree_size
 
-                if self.expansion.query_vec is None:
-                    self.expansion.set_query(self.researcher.query)
-                self.expansion.observe(
-                    result_node_ids,
-                    [r['researchGoal'] for r in results],
-                    [r['learnings'] for r in results],
+            if self.expansion.query_vec is None:
+                self.expansion.set_query(self.researcher.query)
+            self.expansion.observe(
+                result_node_ids,
+                [r['researchGoal'] for r in results],
+                [r['learnings'] for r in results],
+            )
+            if depth > 1:
+                skip, exp_log = self.expansion.decide(
+                    result_node_ids, current_tree_depth, full_tree_size(self.breadth, self.depth)
                 )
-                if depth > 1:
-                    skip, exp_log = self.expansion.decide(
-                        result_node_ids, current_tree_depth, full_tree_size(self.breadth, self.depth)
-                    )
-                    for nid in skip:
-                        child_breadth[nid] = 0
-                    decision_meta["expansion"] = exp_log
-                    decision_meta["child_breadth"] = child_breadth
+                for nid in skip:
+                    child_breadth[nid] = 0
+                decision_meta["expansion"] = exp_log
+                decision_meta["child_breadth"] = child_breadth
 
         tokens_after = TokenTracker.snapshot()
         latency_counts_after = LatencyTracker.snapshot()

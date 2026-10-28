@@ -591,11 +591,14 @@ def build_policy(
         return None
     if name == "replaygym":
         # The learned expansion decisions are applied at the checkpoint
-        # (orchestration/replaygym.py). Evidence handling defaults to "none";
-        # GR_REPLAYGYM_EVIDENCE=<policy> composes it with another row's rule.
-        evidence = os.environ.get("GR_REPLAYGYM_EVIDENCE", "none").strip().lower() or "none"
-        if evidence in ("none", "replaygym", "legacy"):
-            return NoPruningPolicy()
+        # (orchestration/replaygym.py). Evidence handling defaults to the legacy
+        # path, the writer input ReplayGym replays (per-node filtered contexts),
+        # so the policy is served the reward it was trained on.
+        # GR_REPLAYGYM_EVIDENCE=<policy> composes it with another row's rule
+        # (e.g. "none" writes from every retained page instead).
+        evidence = os.environ.get("GR_REPLAYGYM_EVIDENCE", "legacy").strip().lower() or "legacy"
+        if evidence in ("legacy", "replaygym"):
+            return None
         return build_policy(evidence, llm_call=llm_call, budget=budget)
     if name == "none":
         return NoPruningPolicy()

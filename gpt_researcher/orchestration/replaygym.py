@@ -2,8 +2,9 @@
 
 A small MLP, trained with GRPO in the exact-replay environment (harness:
 adr.replay.rl), decides at each checkpoint whether a branch is worth
-researching deeper. Evidence retention is untouched (keep everything, uniform
-allocation, like ``none``); only the expansion decision changes:
+researching deeper. Evidence takes the legacy path unless GR_REPLAYGYM_EVIDENCE
+names another row, because that is the writer input ReplayGym replays; only the
+expansion decision changes:
 
   * first-round checkpoint (tree depth 1): one "go deeper?" per top-level branch;
   * a branch's children checkpoint (tree depth 2): one "go to full depth?" for
@@ -11,7 +12,8 @@ allocation, like ``none``); only the expansion decision changes:
 
 Features must match adr.replay.rl.EpisodeState.features exactly (same inputs,
 same embedding model). Env:
-  GR_REPLAYGYM_POLICY      JSON weights exported by scripts/replaygym_export.py
+  GR_REPLAYGYM_POLICY      JSON weights from the harness's scripts/replaygym_grpo.py export
+  GR_REPLAYGYM_EVIDENCE    evidence row to compose with (default legacy)
   GR_REPLAYGYM_EMBED_URL   OpenAI-style /v1/embeddings for bge-small (default :8323)
   GR_REPLAYGYM_THRESHOLD   go deeper if p >= threshold (default 0.5)
 """
