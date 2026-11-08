@@ -2,6 +2,7 @@ import aiofiles
 import asyncio
 import importlib
 import json
+import re
 import subprocess
 import sys
 import traceback
@@ -91,6 +92,32 @@ SUPPORT_REASONING_EFFORT_MODELS = [
     "gpt-5.5",
     "gpt-5.5-pro",
 ]
+
+# OpenAI reasoning families by name. Azure deployments carry the model name
+# plus a suffix the exact-match lists above cannot know
+# (gpt-6.1-sol-1gtjfzlv8i, gpt-6-luna-t8zcuw231b), so these families are also
+# matched by prefix: "o1"/"o3"/"o4", "gpt-5*" and "gpt-6*", followed by the
+# end of the name, "-" or ".". "gpt-4o" and "gpt-4.1" do not match.
+_REASONING_FAMILY = re.compile(r"^(?:o[134]|gpt-5|gpt-6)(?:$|[.-])")
+
+
+def _bare_model(model: str | None) -> str:
+    """Model id without a router prefix ("openai/gpt-5" -> "gpt-5"), lower case."""
+    return (model or "").strip().split("/")[-1].lower()
+
+
+def is_reasoning_family(model: str | None) -> bool:
+    return bool(_REASONING_FAMILY.match(_bare_model(model)))
+
+
+def supports_temperature(model: str | None) -> bool:
+    """False for models that only accept their default temperature."""
+    return model not in NO_SUPPORT_TEMPERATURE_MODELS and not is_reasoning_family(model)
+
+
+def supports_reasoning_effort(model: str | None) -> bool:
+    return model in SUPPORT_REASONING_EFFORT_MODELS or is_reasoning_family(model)
+
 
 class ReasoningEfforts(Enum):
     High = "high"
