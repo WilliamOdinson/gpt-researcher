@@ -33,6 +33,10 @@ Select a policy with the ``GR_ORCHESTRATOR`` environment variable:
                    per-item Noul verdicts decide the keep mask in code, and
                    per-sub-question sufficiency decides termination and the
                    branch allocation (``TYPESAFE_API_KEY``, ``GR_TYPESAFE_*``)
+  learned          the behavior-cloned orchestrator: serializes the same
+                   state the BC pairs were built from and asks the fine-tuned
+                   model (``GR_ORCH_LLM_MODEL`` / ``GR_ORCH_LLM_BASE_URL``)
+                   for KEEP / ALLOC / DECISION
 
 ``GR_CONTEXT_BUDGET_TOKENS`` (optional) caps the retained evidence per round,
 in approximate tokens (``len(text) // 4``). Used by topk / extractive /
@@ -47,6 +51,7 @@ from .features import (  # noqa: F401
     compute_features,
     coverage_potential_for,
 )
+from .learned import LearnedPolicy  # noqa: F401
 from .randomized import PARAM_SPACE, RandomizedPolicy, derive_seed, sample_params  # noqa: F401
 from .coverage import (  # noqa: F401
     STOP_RETAIN_MODES,

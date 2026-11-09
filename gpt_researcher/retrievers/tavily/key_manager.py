@@ -13,9 +13,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Status codes that signal the current key is drained / rate-limited.
-# 432 is Tavily's custom code for "exceeds your plan's usage limit".
-_EXHAUSTED_STATUS_CODES = {429, 402, 403, 432}
+# Status codes that signal the current key is drained, rate-limited, or
+# invalid. 432 is Tavily's custom code for "exceeds your plan's usage limit".
+# 401 is an invalid key; rotating lets a later key in the pool serve the query.
+_EXHAUSTED_STATUS_CODES = {401, 429, 402, 403, 432}
 
 
 def _find_csv() -> Path:

@@ -40,6 +40,7 @@ POLICY_NAMES = (
     "heuristic_stop",
     "random",
     "typesafe",
+    "learned",
 )
 DEFAULT_POLICY = "legacy"
 
@@ -633,6 +634,12 @@ def build_policy(
             model=os.environ.get(ENV_TYPESAFE_MODEL, "").strip() or None,
             thresholds=thresholds_from_env(),
         )
+    if name == "learned":
+        if llm_call is None:
+            raise ValueError("learned policy needs an llm_call")
+        from .learned import LearnedPolicy
+
+        return LearnedPolicy(llm_call=llm_call, budget=budget)
     raise ValueError(f"Unknown orchestration policy {name!r}")
 
 

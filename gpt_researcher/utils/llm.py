@@ -110,9 +110,13 @@ async def create_chat_completion(
     provider_kwargs['max_tokens'] = max_tokens
 
     if llm_provider == "openai":
-        base_url = os.environ.get("OPENAI_BASE_URL", None)
-        if base_url:
-            provider_kwargs['openai_api_base'] = base_url
+        # Do not clobber an explicit base (GR_ORCH_LLM_BASE_URL / llm_kwargs).
+        # The process also has OPENAI_BASE_URL for Azure researcher/embeddings;
+        # overwriting here sent the learned orchestrator to Azure with key EMPTY.
+        if not provider_kwargs.get("openai_api_base") and not provider_kwargs.get("base_url"):
+            base_url = os.environ.get("OPENAI_BASE_URL", None)
+            if base_url:
+                provider_kwargs["openai_api_base"] = base_url
 
     provider = get_llm(llm_provider, **provider_kwargs)
     response = ""

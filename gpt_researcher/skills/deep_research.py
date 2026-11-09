@@ -258,6 +258,108 @@ def trim_context_to_word_limit(context_list: List[str], max_words: int = MAX_CON
 
     return trimmed_context
 
+
+# Final synthesis context under an orchestration policy. ``ranked`` (default)
+# reserves a share of the word cap for the distilled learnings and fills the
+# rest with retained evidence ranked by relevance, round-robin across
+# sub-questions, so the policy's keep mask decides what the writer sees.
+# ``recency`` is the old behavior: learnings first, then the retained set in
+# retrieval order, trimmed from the end by trim_context_to_word_limit, which
+# drops the learnings and the earliest evidence once the cap binds.
+ENV_FINAL_CONTEXT = "GR_FINAL_CONTEXT"
+ENV_FINAL_LEARNINGS_SHARE = "GR_FINAL_LEARNINGS_SHARE"
+ENV_FINAL_ITEM_MAX_WORDS = "GR_FINAL_ITEM_MAX_WORDS"
+FINAL_CONTEXT_MODES = ("ranked", "recency")
+DEFAULT_LEARNINGS_SHARE = 0.2
+DEFAULT_ITEM_MAX_WORDS = 1500
+
+
+def _cosine(a: Optional[list[float]], b: Optional[list[float]]) -> float:
+    if a is None or b is None:
+        return 0.0
+    va = np.asarray(a, dtype=np.float32)
+    vb = np.asarray(b, dtype=np.float32)
+    denom = float(np.linalg.norm(va) * np.linalg.norm(vb))
+    return float(va @ vb) / denom if denom > 0 else 0.0
+
+
+def build_final_context(
+    learnings: List[str],
+    evidence: List[Any],
+    *,
+    query_embedding: Optional[list[float]] = None,
+    subquestion_embeddings: Optional[List[list[float]]] = None,
+    max_words: int = MAX_CONTEXT_WORDS,
+    learnings_share: float = DEFAULT_LEARNINGS_SHARE,
+    item_max_words: int = DEFAULT_ITEM_MAX_WORDS,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Writer context from the learnings and the retained evidence K_T.
+
+    ``evidence`` items need ``source_url``, ``content``, ``embedding``,
+    ``retrieval_round`` and ``tree_depth`` (EvidenceItem). Learnings take up
+    to ``learnings_share`` of ``max_words``; evidence gets the rest. Each item
+    is assigned to its closest sub-question and the groups are drained
+    round-robin, most query-relevant first, so no sub-question is crowded out.
+    Items longer than ``item_max_words`` (0 = no cap) are cut to their head so
+    a few long pages cannot fill the cap. Selected items are emitted in
+    retrieval order. Returns the context list and a small stats dict.
+    """
+    learn_cap = int(max_words * max(0.0, min(1.0, learnings_share)))
+    learn_out: List[str] = []
+    learn_words = 0
+    for line in learnings:
+        w = count_words(line)
+        if learn_words + w > learn_cap:
+            continue
+        learn_out.append(line)
+        learn_words += w
+
+    subqs = [v for v in (subquestion_embeddings or []) if v is not None]
+    groups: Dict[int, List[tuple[float, int, Any]]] = defaultdict(list)
+    for idx, e in enumerate(evidence):
+        rel = _cosine(query_embedding, e.embedding)
+        if subqs and e.embedding is not None:
+            g = int(np.argmax([_cosine(s, e.embedding) for s in subqs]))
+        else:
+            g = 0
+        groups[g].append((rel, idx, e))
+    for g in groups:
+        groups[g].sort(key=lambda t: (-t[0], t[1]))
+
+    order: List[tuple[int, Any]] = []
+    queues = [groups[g] for g in sorted(groups)]
+    while any(queues):
+        for q in queues:
+            if q:
+                _, idx, e = q.pop(0)
+                order.append((idx, e))
+
+    remaining = max_words - learn_words
+    picked: List[tuple[int, str]] = []
+    for idx, e in order:
+        words = str(e.content).split()
+        if item_max_words and len(words) > item_max_words:
+            words = words[:item_max_words]
+        text = DeepResearchSkill._format_item(e.source_url, " ".join(words))
+        w = count_words(text)
+        if w > remaining:
+            continue
+        picked.append((idx, text))
+        remaining -= w
+
+    picked.sort(key=lambda t: (evidence[t[0]].retrieval_round, evidence[t[0]].tree_depth, t[0]))
+    context = learn_out + [text for _, text in picked]
+    stats = {
+        "mode": "ranked",
+        "learnings_in": len(learnings),
+        "learnings_used": len(learn_out),
+        "evidence_in": len(evidence),
+        "evidence_used": len(picked),
+        "words": max_words - remaining,
+    }
+    return context, stats
+
+
 class ResearchProgress:
     def __init__(self, total_depth: int, total_breadth: int):
         self.current_depth = 1  # Start from 1 and increment up to total_depth
@@ -303,14 +405,36 @@ class DeepResearchSkill:
         )
 
     async def _orchestrator_llm_call(self, messages: List[Dict[str, str]]) -> str:
-        """LLM call used by the prompted policy; metered like every other call."""
+        """LLM call used by the prompted / learned policies; metered like every
+        other call.
+
+        Defaults to the strategic model. ``GR_ORCH_LLM_MODEL`` points the
+        orchestrator at a different model (e.g. a fine-tuned checkpoint);
+        ``GR_ORCH_LLM_BASE_URL`` / ``GR_ORCH_LLM_API_KEY`` route it to any
+        OpenAI-compatible server (vLLM, a Colab tunnel, ...) without touching
+        the rest of the run's LLM configuration.
+        """
+        model = os.environ.get("GR_ORCH_LLM_MODEL", "").strip() or self.researcher.cfg.strategic_llm_model
+        provider = os.environ.get("GR_ORCH_LLM_PROVIDER", "").strip() or (
+            "openai" if os.environ.get("GR_ORCH_LLM_BASE_URL", "").strip() else self.researcher.cfg.strategic_llm_provider
+        )
+        llm_kwargs: Dict[str, Any] = dict(self.researcher.cfg.llm_kwargs or {})
+        base_url = os.environ.get("GR_ORCH_LLM_BASE_URL", "").strip()
+        if base_url:
+            # Set both names: langchain-openai accepts either; the OpenAI SDK
+            # reads `base_url`. create_chat_completion must not overwrite these
+            # with process-level OPENAI_BASE_URL (Azure).
+            llm_kwargs["openai_api_base"] = base_url
+            llm_kwargs["base_url"] = base_url
+            llm_kwargs["openai_api_key"] = os.environ.get("GR_ORCH_LLM_API_KEY", "").strip() or "EMPTY"
+            llm_kwargs["api_key"] = llm_kwargs["openai_api_key"]
         return await create_chat_completion(
             messages=messages,
-            llm_provider=self.researcher.cfg.strategic_llm_provider,
-            model=self.researcher.cfg.strategic_llm_model,
+            llm_provider=provider,
+            model=model,
             temperature=0.0,
             max_tokens=2000,
-            llm_kwargs=self.researcher.cfg.llm_kwargs,
+            llm_kwargs=llm_kwargs,
             usage_tag="orchestrator",
         )
 
@@ -942,12 +1066,6 @@ Return ONLY a JSON object using this exact schema:
                 "total_costs": self.researcher.get_costs()
             })
 
-        # With a policy active the final evidence context is the retained set
-        # K_T as decided round by round (including supersession of earlier
-        # items and any compression), not the per-level lists.
-        if self.orchestrator is not None:
-            results['context'] = self._retained_context()
-
         # Prepare context with citations
         context_with_citations = []
         for learning in results['learnings']:
@@ -957,12 +1075,30 @@ Return ONLY a JSON object using this exact schema:
             else:
                 context_with_citations.append(learning)
 
-        # Add all research context
-        if results.get('context'):
-            context_with_citations.extend(results['context'])
-
-        # Trim final context to word limit
-        final_context = trim_context_to_word_limit(context_with_citations)
+        # With a policy active the final evidence context is the retained set
+        # K_T as decided round by round (including supersession of earlier
+        # items and any compression), not the per-level lists.
+        final_mode = os.environ.get(ENV_FINAL_CONTEXT, "").strip().lower() or "ranked"
+        if final_mode not in FINAL_CONTEXT_MODES:
+            raise ValueError(f"{ENV_FINAL_CONTEXT}={final_mode!r} is not one of {FINAL_CONTEXT_MODES}")
+        if self.orchestrator is not None and final_mode == "ranked":
+            share_raw = os.environ.get(ENV_FINAL_LEARNINGS_SHARE, "").strip()
+            cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
+            final_context, final_stats = build_final_context(
+                context_with_citations,
+                list(self.trajectory_logger.get_retained_evidence().values()),
+                query_embedding=self.query_embedding,
+                subquestion_embeddings=self.subq_embeddings,
+                learnings_share=float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE,
+                item_max_words=int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS,
+            )
+            logger.info(f"Final context: {final_stats}")
+        else:
+            if self.orchestrator is not None:
+                results['context'] = self._retained_context()
+            if results.get('context'):
+                context_with_citations.extend(results['context'])
+            final_context = trim_context_to_word_limit(context_with_citations)
 
         # Set enhanced context and visited URLs
         self.researcher.context = "\n".join(

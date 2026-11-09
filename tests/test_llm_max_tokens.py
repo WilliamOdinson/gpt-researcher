@@ -41,3 +41,56 @@ async def test_create_chat_completion_rejects_absurd_max_tokens():
             )
 
     mock_get_llm.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_chat_completion_does_not_clobber_explicit_openai_base(monkeypatch):
+    """Learned orchestrator sets GR_ORCH_LLM_BASE_URL via llm_kwargs; the
+    process still has Azure OPENAI_BASE_URL for researcher/embeddings."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.openai.azure.com/openai/v1")
+    provider = MagicMock()
+    provider.get_chat_response = AsyncMock(return_value="KEEP: ALL")
+    provider.last_response_metadata = {}
+    provider.last_usage_metadata = {"input_tokens": 1, "output_tokens": 1}
+
+    with patch("gpt_researcher.utils.llm.get_llm", return_value=provider) as mock_get_llm:
+        result = await create_chat_completion(
+            messages=[{"role": "user", "content": "x"}],
+            model="pilot-bc",
+            max_tokens=16,
+            temperature=0.0,
+            llm_provider="openai",
+            llm_kwargs={
+                "openai_api_base": "https://tunnel.example/v1",
+                "base_url": "https://tunnel.example/v1",
+                "openai_api_key": "EMPTY",
+            },
+        )
+
+    assert result == "KEEP: ALL"
+    kwargs = mock_get_llm.call_args.kwargs
+    assert kwargs["openai_api_base"] == "https://tunnel.example/v1"
+    assert kwargs["base_url"] == "https://tunnel.example/v1"
+    assert kwargs["openai_api_key"] == "EMPTY"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_completion_uses_env_openai_base_when_unset(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.openai.azure.com/openai/v1")
+    provider = MagicMock()
+    provider.get_chat_response = AsyncMock(return_value="ok")
+    provider.last_response_metadata = {}
+    provider.last_usage_metadata = {"input_tokens": 1, "output_tokens": 1}
+
+    with patch("gpt_researcher.utils.llm.get_llm", return_value=provider) as mock_get_llm:
+        await create_chat_completion(
+            messages=[{"role": "user", "content": "x"}],
+            model="gpt-4o-mini",
+            max_tokens=16,
+            temperature=0.0,
+            llm_provider="openai",
+        )
+
+    assert mock_get_llm.call_args.kwargs["openai_api_base"] == (
+        "https://example.openai.azure.com/openai/v1"
+    )

@@ -63,6 +63,10 @@ NO_SUPPORT_TEMPERATURE_MODELS = [
     "gpt-5.4-pro",
     "gpt-5.5",
     "gpt-5.5-pro",
+    # GPT-6 family, by Azure Foundry deployment name (202610-deepres)
+    "gpt-6.1-sol-1gtjfzlv8i",
+    "gpt-6.1-terra-e9kcfzynjl",
+    "gpt-6-luna-t8zcuw231b",
     # Claude 4.x family: Anthropic deprecates temperature on these models
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-20250929",
@@ -90,6 +94,9 @@ SUPPORT_REASONING_EFFORT_MODELS = [
     "gpt-5.4-pro",
     "gpt-5.5",
     "gpt-5.5-pro",
+    "gpt-6.1-sol-1gtjfzlv8i",
+    "gpt-6.1-terra-e9kcfzynjl",
+    "gpt-6-luna-t8zcuw231b",
 ]
 
 class ReasoningEfforts(Enum):
