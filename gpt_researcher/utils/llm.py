@@ -27,6 +27,10 @@ from .token_tracker import TokenTracker
 from .validators import Subtopics
 
 
+_AZURE_FLEX_MODELS = {"gpt-6.1-sol-1gtjfzlv8i"}
+_LEARNED_ORCHESTRATOR_MODELS = {"pilot-bc-teacher", "pilot-dpo-teacher"}
+
+
 def get_llm(llm_provider: str, **kwargs):
     """Get an LLM provider instance.
 
@@ -95,6 +99,15 @@ async def create_chat_completion(
             provider_kwargs.update(json.loads(os.environ["LLM_KWARGS"]))
         except json.JSONDecodeError:
             pass
+
+    # The DRB Sol deployment must always request Azure Flex, even if a stale
+    # LLM_KWARGS value asks for another tier. Conversely, the learned BC/DPO
+    # adapters are served by a separate OpenAI-compatible vLLM endpoint and
+    # must never receive Azure's service_tier request parameter.
+    if llm_provider == "openai" and model in _AZURE_FLEX_MODELS:
+        provider_kwargs["service_tier"] = "flex"
+    elif model in _LEARNED_ORCHESTRATOR_MODELS:
+        provider_kwargs.pop("service_tier", None)
 
     if model in SUPPORT_REASONING_EFFORT_MODELS:
         provider_kwargs['reasoning_effort'] = reasoning_effort
