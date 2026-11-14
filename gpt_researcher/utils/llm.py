@@ -23,12 +23,59 @@ from gpt_researcher.llm_provider.generic.base import (
 from ..prompts import PromptFamily
 from .costs import calculate_llm_cost
 from .latency_tracker import LatencyTracker
+from .llm_call_log import LLMCallLog
 from .token_tracker import TokenTracker
 from .validators import Subtopics
 
 
 _AZURE_FLEX_MODELS = {"gpt-6.1-sol-1gtjfzlv8i"}
 _LEARNED_ORCHESTRATOR_MODELS = {"pilot-bc-teacher", "pilot-dpo-teacher"}
+
+# Normal attempts per call (errors, empty responses, timeouts).
+LLM_MAX_ATTEMPTS = 10
+# GR_LLM_REQUEST_TIMEOUT_S: seconds before one request is abandoned and counted
+# as a failed attempt, so a hung call cannot stall a run. 0 = no timeout.
+ENV_REQUEST_TIMEOUT_S = "GR_LLM_REQUEST_TIMEOUT_S"
+DEFAULT_REQUEST_TIMEOUT_S = 300.0
+# GR_LLM_CAPACITY_MAX_WAIT_S: total seconds one call may spend waiting out
+# Azure Flex "429 no_capacity" rejections. These retries do not use up the
+# normal attempts; once the wait budget is spent the call fails.
+ENV_CAPACITY_MAX_WAIT_S = "GR_LLM_CAPACITY_MAX_WAIT_S"
+DEFAULT_CAPACITY_MAX_WAIT_S = 3600.0
+CAPACITY_BACKOFF_START_S = 5.0
+CAPACITY_BACKOFF_MAX_S = 60.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(f"{name}={raw!r} is not a number; using {default}")
+        return default
+
+
+def is_capacity_error(exc: BaseException) -> bool:
+    """True for a Flex capacity rejection: HTTP 429 whose error code or message
+    says ``no_capacity``. Ordinary 429 rate limits are not capacity errors and
+    use the normal attempts."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    text = str(exc)
+    if status != 429 and "Error code: 429" not in text:
+        return False
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.lower() == "no_capacity":
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict) and str(err.get("code", "")).lower() == "no_capacity":
+            return True
+    return "no_capacity" in text.lower()
 
 
 def get_llm(llm_provider: str, **kwargs):
@@ -131,35 +178,103 @@ async def create_chat_completion(
             if base_url:
                 provider_kwargs["openai_api_base"] = base_url
 
+    request_timeout_s = _env_float(ENV_REQUEST_TIMEOUT_S, DEFAULT_REQUEST_TIMEOUT_S)
+    capacity_max_wait_s = _env_float(ENV_CAPACITY_MAX_WAIT_S, DEFAULT_CAPACITY_MAX_WAIT_S)
+    if llm_provider == "openai":
+        # Retries happen in the loop below, where each attempt is counted and
+        # Flex capacity rejections are told apart; the client's own silent
+        # retries would hide both. An explicit llm_kwargs value still wins.
+        provider_kwargs.setdefault("max_retries", 0)
+        if request_timeout_s > 0:
+            provider_kwargs.setdefault("timeout", request_timeout_s)
+
     provider = get_llm(llm_provider, **provider_kwargs)
     response = ""
     _llm_start = time.time()
-    max_attempts = 1 if (stream and websocket is not None) else 10
+    max_attempts = 1 if (stream and websocket is not None) else LLM_MAX_ATTEMPTS
     last_exception: Exception | None = None
-    for attempt in range(1, max_attempts + 1):
+    log = logging.getLogger(__name__)
+    call = {
+        "model": model,
+        "usage_tag": usage_tag,
+        "tier_requested": provider_kwargs.get("service_tier"),
+        "tier_served": None,
+        "start": _llm_start,
+        "end": None,
+        "duration_s": None,
+        "attempts": 0,
+        "capacity_retries": 0,
+        "capacity_wait_s": 0.0,
+        "timeouts": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "status": "failed",
+        "error": None,
+    }
+
+    def _finish(status: str, error: BaseException | None = None) -> None:
+        end = time.time()
+        call.update(
+            end=end,
+            duration_s=round(end - _llm_start, 4),
+            capacity_wait_s=round(call["capacity_wait_s"], 4),
+            status=status,
+            error=None if error is None else f"{type(error).__name__}: {error}"[:500],
+        )
+        LLMCallLog.record(call)
+
+    attempt = 0
+    capacity_backoff = CAPACITY_BACKOFF_START_S
+    while attempt < max_attempts:
+        attempt += 1
+        call["attempts"] = attempt
+        t_req = time.time()
         try:
-            response = await provider.get_chat_response(
-                messages, stream, websocket, **kwargs
-            )
-        except Exception as exc:
+            request = provider.get_chat_response(messages, stream, websocket, **kwargs)
+            if request_timeout_s > 0:
+                response = await asyncio.wait_for(request, timeout=request_timeout_s)
+            else:
+                response = await request
+        except asyncio.TimeoutError as exc:
             last_exception = exc
-            logging.getLogger(__name__).warning(
-                f"LLM request failed (attempt {attempt}/{max_attempts}): {exc}"
+            call["timeouts"] += 1
+            log.warning(
+                f"LLM request timed out after {request_timeout_s:.0f}s "
+                f"(attempt {attempt}/{max_attempts})"
             )
             if attempt < max_attempts:
                 await asyncio.sleep(min(2 ** (attempt - 1), 8))
+            continue
+        except Exception as exc:
+            last_exception = exc
+            if is_capacity_error(exc) and call["capacity_wait_s"] < capacity_max_wait_s:
+                # Flex has no capacity right now: wait and retry without using
+                # up a normal attempt, until the wait budget is spent.
+                attempt -= 1
+                sleep_s = min(capacity_backoff, max(0.0, capacity_max_wait_s - call["capacity_wait_s"]))
+                call["capacity_retries"] += 1
+                log.warning(
+                    f"LLM capacity unavailable (429 no_capacity, retry {call['capacity_retries']}); "
+                    f"waiting {sleep_s:.0f}s"
+                )
+                await asyncio.sleep(sleep_s)
+                call["capacity_wait_s"] += time.time() - t_req
+                capacity_backoff = min(capacity_backoff * 2, CAPACITY_BACKOFF_MAX_S)
                 continue
-            break
+            if "timeout" in type(exc).__name__.lower():
+                # The client's own timeout (e.g. openai.APITimeoutError).
+                call["timeouts"] += 1
+            log.warning(f"LLM request failed (attempt {attempt}/{max_attempts}): {exc}")
+            if attempt < max_attempts:
+                await asyncio.sleep(min(2 ** (attempt - 1), 8))
+            continue
 
         if not response:
             last_exception = RuntimeError("Empty response from LLM provider")
-            logging.getLogger(__name__).warning(
-                f"LLM returned empty response (attempt {attempt}/{max_attempts})"
-            )
+            log.warning(f"LLM returned empty response (attempt {attempt}/{max_attempts})")
             if attempt < max_attempts:
                 await asyncio.sleep(min(2 ** (attempt - 1), 8))
-                continue
-            break
+            continue
 
         llm_costs = calculate_llm_cost(
             llm_provider=llm_provider,
@@ -181,9 +296,17 @@ async def create_chat_completion(
             _output_tokens = usage_meta.get("output_tokens", 0) or usage_meta.get("completion_tokens", 0) or 0
         TokenTracker.track_tokens(model, _input_tokens, _output_tokens, llm_costs, usage_tag=usage_tag)
         LatencyTracker.track_latency("llm", time.time() - _llm_start, source=model)
+        meta = provider.last_response_metadata
+        call.update(
+            input_tokens=int(_input_tokens),
+            output_tokens=int(_output_tokens),
+            tier_served=meta.get("service_tier") if isinstance(meta, dict) else None,
+        )
+        _finish("ok")
 
         return response
 
+    _finish("failed", last_exception)
     logging.error(f"Failed to get response from {llm_provider} API")
     raise RuntimeError(f"Failed to get response from {llm_provider} API") from last_exception
 
