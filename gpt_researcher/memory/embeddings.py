@@ -29,6 +29,19 @@ OPENAI_EMBEDDING_MODEL = os.environ.get(
     "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
 )
 
+ENV_EMBEDDING_REQUEST_TIMEOUT_S = "GR_EMBEDDING_REQUEST_TIMEOUT_S"
+DEFAULT_EMBEDDING_REQUEST_TIMEOUT_S = 120.0
+
+
+def embedding_request_timeout_s() -> float:
+    """Seconds before one OpenAI embedding request is abandoned (0 = no timeout)."""
+    raw = os.environ.get(ENV_EMBEDDING_REQUEST_TIMEOUT_S, "").strip()
+    try:
+        return float(raw) if raw else DEFAULT_EMBEDDING_REQUEST_TIMEOUT_S
+    except ValueError:
+        return DEFAULT_EMBEDDING_REQUEST_TIMEOUT_S
+
+
 _SUPPORTED_PROVIDERS = {
     "openai",
     "azure_openai",
@@ -104,6 +117,14 @@ class Memory:
                 # Support custom OpenAI-compatible APIs via OPENAI_BASE_URL
                 if "openai_api_base" not in embedding_kwargs and os.environ.get("OPENAI_BASE_URL"):
                     embedding_kwargs["openai_api_base"] = os.environ["OPENAI_BASE_URL"]
+
+                # GR_EMBEDDING_REQUEST_TIMEOUT_S (default 120, 0 = off): without
+                # a timeout a dropped connection hangs the run indefinitely, as
+                # chat calls did before GR_LLM_REQUEST_TIMEOUT_S. Explicit
+                # embedding_kwargs still win.
+                timeout_s = embedding_request_timeout_s()
+                if timeout_s > 0 and "request_timeout" not in embedding_kwargs and "timeout" not in embedding_kwargs:
+                    embedding_kwargs["request_timeout"] = timeout_s
 
                 _embeddings = OpenAIEmbeddings(model=model, **embedding_kwargs)
             case "azure_openai":
