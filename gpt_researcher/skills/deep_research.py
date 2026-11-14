@@ -17,6 +17,7 @@ from ..utils.enum import ReportType, ReportSource, Tone
 from ..utils.scraper_cache import _global_scraper_cache
 from ..utils.search_cache import _global_search_cache
 from ..utils.token_tracker import TokenTracker
+from ..utils.llm_call_log import LLMCallLog
 from ..utils.trajectory_logger import (
     TrajectoryLogger, FrontierNode, RoundCost, make_item_id,
 )
@@ -273,6 +274,45 @@ FINAL_CONTEXT_MODES = ("ranked", "recency")
 DEFAULT_LEARNINGS_SHARE = 0.2
 DEFAULT_ITEM_MAX_WORDS = 1500
 
+# Token stopping rule (GR_STOP_TOTAL_TOKENS). Before each new round and each
+# sub-query, research stops if that next step, at the largest cost seen so far,
+# plus the tokens the final report is expected to need, would take the query's
+# total (input + output of every LLM call: the TokenTracker total that the
+# harness reports as the run's tokens) past the target. This is a stopping
+# rule, not a hard cap: a step costlier than any seen before, or a report
+# longer than estimated, can still end the run above the target; the harness
+# records whether it did. Unset / 0 = no stopping rule (default).
+ENV_STOP_TOTAL_TOKENS = "GR_STOP_TOTAL_TOKENS"
+# Tokens reserved for the report: ``auto`` (default) estimates them from the
+# writer context the retained evidence and learnings would build; an integer
+# reserves that many tokens regardless of the evidence ("equal research
+# budget" rather than "equal total budget").
+ENV_REPORT_RESERVE_TOKENS = "GR_REPORT_RESERVE_TOKENS"
+REPORT_RESERVE_AUTO = "auto"
+# Report-cost model for ``auto``, fit on 103 GPT-6.1 Sol DeepResearchGym
+# reports (17k-25k context words): prompt tokens were 1.34-1.43 x context
+# words, completion tokens at most 6.9k. Rounded up so the estimate errs high.
+REPORT_TOKENS_PER_WORD = 1.45
+REPORT_PROMPT_OVERHEAD_TOKENS = 1500
+REPORT_OUTPUT_TOKENS = 7000
+# Cost guesses used until the first sub-query / round has been measured.
+DEFAULT_SUBQUERY_COST_TOKENS = 20000
+DEFAULT_ROUND_OVERHEAD_TOKENS = 4000
+# Writer-context words a sub-query adds, until the first round is measured.
+DEFAULT_SUBQUERY_CONTEXT_WORDS = 4000
+# Words of "Source: <url>" / "Content:" framing per evidence item.
+_ITEM_FRAME_WORDS = 3
+
+
+def report_tokens_for_words(words: int) -> int:
+    """Expected report cost (prompt + completion) for a writer context of ``words``."""
+    return int(REPORT_TOKENS_PER_WORD * max(0, words)) + REPORT_PROMPT_OVERHEAD_TOKENS + REPORT_OUTPUT_TOKENS
+
+
+def _tokens_used() -> int:
+    snap = TokenTracker.snapshot()
+    return int(snap.get("input_tokens", 0)) + int(snap.get("output_tokens", 0))
+
 
 def _cosine(a: Optional[list[float]], b: Optional[list[float]]) -> float:
     if a is None or b is None:
@@ -399,10 +439,117 @@ class DeepResearchSkill:
         self.subq_embeddings: list[list[float]] = []
         # Set when a policy returns u=terminate; every pending recursion stops.
         self.stop_requested = False
+        # Token stopping rule (GR_STOP_TOTAL_TOKENS); see _token_stop_blocks.
+        raw_target = os.environ.get(ENV_STOP_TOTAL_TOKENS, "").strip()
+        self.stop_total_tokens: int | None = int(raw_target) if raw_target and int(raw_target) > 0 else None
+        raw_reserve = os.environ.get(ENV_REPORT_RESERVE_TOKENS, "").strip().lower() or REPORT_RESERVE_AUTO
+        self.report_reserve_fixed: int | None = None if raw_reserve == REPORT_RESERVE_AUTO else int(raw_reserve)
+        self._subquery_costs: list[int] = []
+        self._round_overheads: list[int] = []
+        # Writer-context growth per sub-query (words), measured at checkpoints.
+        self._subquery_context_words: list[float] = []
+        # Sub-queries finished since the last checkpoint (their evidence is not
+        # in the retained set yet).
+        self._pending_subqueries = 0
+        self._learnings_seen: dict[str, None] = {}
+        self.token_stop_info: Dict[str, Any] = {
+            "stop_total_tokens": self.stop_total_tokens,
+            "report_reserve": (
+                None if self.stop_total_tokens is None
+                else (REPORT_RESERVE_AUTO if self.report_reserve_fixed is None else self.report_reserve_fixed)
+            ),
+            "stopped": False,
+            "stopped_at": None,
+            "tokens_at_stop": None,
+            "next_step_estimate": None,
+            "report_reserve_at_stop": None,
+            "writer_words_projected_at_stop": None,
+            "skipped_subqueries": 0,
+            "skipped_rounds": 0,
+        }
         logger.info(
             f"DeepResearchSkill initialized: depth={self.depth}, breadth={self.breadth}, "
-            f"orchestrator={self.policy_name}, context_budget={self.token_budget}"
+            f"orchestrator={self.policy_name}, context_budget={self.token_budget}, "
+            f"stop_total_tokens={self.stop_total_tokens}, "
+            f"report_reserve={self.token_stop_info['report_reserve']}"
         )
+
+    def _writer_context_words(self) -> int:
+        """Words the final writer context would hold if research stopped now.
+
+        Mirrors build_final_context (ranked mode under a policy): learnings up
+        to their share of the word cap, plus each retained item cut to
+        GR_FINAL_ITEM_MAX_WORDS, all within MAX_CONTEXT_WORDS. Without a policy
+        or in recency mode the writer gets the trimmed raw context, so the
+        estimate is the full word cap."""
+        final_mode = os.environ.get(ENV_FINAL_CONTEXT, "").strip().lower() or "ranked"
+        if self.orchestrator is None or final_mode != "ranked":
+            return MAX_CONTEXT_WORDS
+        share_raw = os.environ.get(ENV_FINAL_LEARNINGS_SHARE, "").strip()
+        share = float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE
+        cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
+        item_max = int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS
+        learn_cap = int(MAX_CONTEXT_WORDS * max(0.0, min(1.0, share)))
+        learn_words = min(learn_cap, sum(count_words(l) for l in self._learnings_seen))
+        ev_words = 0
+        for e in self.trajectory_logger.get_retained_evidence().values():
+            w = len(str(e.content).split())
+            ev_words += (min(w, item_max) if item_max else w) + _ITEM_FRAME_WORDS
+        return min(MAX_CONTEXT_WORDS, learn_words + ev_words)
+
+    def _report_reserve(self) -> tuple[int, int | None]:
+        """Tokens to hold back for the report if one more sub-query runs, and
+        the projected writer-context words behind them (None for a fixed reserve)."""
+        if self.report_reserve_fixed is not None:
+            return self.report_reserve_fixed, None
+        growth = max(self._subquery_context_words, default=DEFAULT_SUBQUERY_CONTEXT_WORDS)
+        projected = min(
+            MAX_CONTEXT_WORDS,
+            int(self._writer_context_words() + growth * (self._pending_subqueries + 1)),
+        )
+        return report_tokens_for_words(projected), projected
+
+    def _token_stop_blocks(self, unit: str) -> bool:
+        """True when starting one more ``unit`` (``round`` | ``subquery``) would,
+        by the current estimates, take the query past GR_STOP_TOTAL_TOKENS once
+        the report is written. The first time it blocks, research stops for
+        every pending branch. A stopping rule, not a hard cap: the estimates are
+        the largest costs seen so far, so an unusually costly step or report can
+        still overshoot."""
+        if self.stop_total_tokens is None:
+            return False
+        # Either unit is followed by at least one round checkpoint (and a round
+        # must fit at least one sub-query), so both estimates are one sub-query
+        # plus one round overhead, at the largest cost seen so far.
+        est = (max(self._subquery_costs, default=DEFAULT_SUBQUERY_COST_TOKENS)
+               + max(self._round_overheads, default=DEFAULT_ROUND_OVERHEAD_TOKENS))
+        reserve, projected_words = self._report_reserve()
+        used = _tokens_used()
+        if used + est + reserve <= self.stop_total_tokens:
+            return False
+        info = self.token_stop_info
+        info["skipped_rounds" if unit == "round" else "skipped_subqueries"] += 1
+        if not info["stopped"]:
+            info.update(
+                stopped=True,
+                stopped_at=unit,
+                tokens_at_stop=used,
+                next_step_estimate=est,
+                report_reserve_at_stop=reserve,
+                writer_words_projected_at_stop=projected_words,
+            )
+            self.stop_requested = True
+            logger.info(
+                f"Token stopping rule: stopping research before next {unit} "
+                f"(used={used}, est_next={est}, report_reserve={reserve}, "
+                f"target={self.stop_total_tokens})"
+            )
+            print(
+                f"\nTOKEN STOP: {used} used + next {unit} ~{est} + report ~{reserve} "
+                f"> {self.stop_total_tokens}; stopping research.",
+                flush=True,
+            )
+        return True
 
     async def _orchestrator_llm_call(self, messages: List[Dict[str, str]]) -> str:
         """LLM call used by the prompted / learned policies; metered like every
@@ -641,7 +788,22 @@ Return ONLY a JSON object using this exact schema:
         all_context = []
         all_sources = []
 
+        if self.stop_requested or self._token_stop_blocks("round"):
+            return {
+                'learnings': all_learnings,
+                'visited_urls': all_visited_urls,
+                'citations': all_citations,
+                'context': all_context,
+                'sources': all_sources,
+            }
+
         print(f"🔎 Generating {breadth} search queries...", flush=True)
+        # Round overhead = everything in the round outside its sub-queries
+        # (search-query generation, the policy's checkpoint call); measured
+        # just before descending.
+        overhead_start = _tokens_used()
+        n_costs_before = len(self._subquery_costs)
+        writer_words_before = self._writer_context_words() if self.stop_total_tokens else 0
         serp_queries = await self.generate_search_queries(query, num_queries=breadth)
         print(f"✅ Generated {len(serp_queries)} queries: {[q['query'] for q in serp_queries]}", flush=True)
         progress.total_queries = len(serp_queries)
@@ -660,6 +822,9 @@ Return ONLY a JSON object using this exact schema:
 
         async def process_query(serp_query: Dict[str, str]) -> Optional[Dict[str, Any]]:
             async with semaphore:
+                if self._token_stop_blocks("subquery"):
+                    return None
+                subquery_start = _tokens_used()
                 try:
                     progress.current_query = serp_query['query']
                     if on_progress:
@@ -692,6 +857,13 @@ Return ONLY a JSON object using this exact schema:
                         query=serp_query['query'],
                         context=context
                     )
+
+                    # Exact with concurrency 1; an over-estimate otherwise
+                    # (overlapping sub-queries are counted together).
+                    self._subquery_costs.append(_tokens_used() - subquery_start)
+                    self._pending_subqueries += 1
+                    for learning in results['learnings']:
+                        self._learnings_seen.setdefault(learning, None)
 
                     # Update progress
                     progress.completed_queries += 1
@@ -729,6 +901,14 @@ Return ONLY a JSON object using this exact schema:
         # #1579: if every branch at this level failed (bad API key, offline
         # retriever, etc.), stop instead of endlessly generating follow-ups
         # from empty goals / empty learnings.
+        if not results and self.token_stop_info["stopped"]:
+            return {
+                'learnings': all_learnings,
+                'visited_urls': all_visited_urls,
+                'citations': all_citations,
+                'context': all_context,
+                'sources': all_sources,
+            }
         if not results:
             logger.warning(
                 "Deep research produced no successful query results at depth=%s; stopping descent.",
@@ -979,6 +1159,17 @@ Return ONLY a JSON object using this exact schema:
             f"child_breadth={child_breadth}"
         )
 
+        self._round_overheads.append(max(
+            0,
+            _tokens_used() - overhead_start - sum(self._subquery_costs[n_costs_before:]),
+        ))
+        # Writer-context growth per sub-query this round, after the policy's
+        # keep/compress decision (so pruning policies grow slowly).
+        if self.stop_total_tokens and results:
+            grown = self._writer_context_words() - writer_words_before
+            self._subquery_context_words.append(max(0.0, grown / len(results)))
+        self._pending_subqueries = 0
+
         for result, node_id in zip(results, result_node_ids):
             # Continue deeper if needed, unless a policy asked to stop.
             if depth > 1 and not self.stop_requested:
@@ -1033,6 +1224,7 @@ Return ONLY a JSON object using this exact schema:
         start_time = time.time()
 
         TokenTracker.reset()
+        LLMCallLog.reset()
         LatencyTracker.reset()
 
         # Log initial costs
@@ -1133,6 +1325,7 @@ Return ONLY a JSON object using this exact schema:
         except Exception as e:
             logger.warning(f"Aux vector embedding failed (non-fatal): {e}")
 
+        self.token_stop_info["research_tokens"] = _tokens_used()
         token_totals = TokenTracker.get_totals()
         token_totals["tool_calls"] = sum(
             d.get("count", 0) for d in LatencyTracker.per_type_latencies.values()
