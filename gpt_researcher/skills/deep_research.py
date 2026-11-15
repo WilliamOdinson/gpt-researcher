@@ -304,6 +304,45 @@ DEFAULT_SUBQUERY_CONTEXT_WORDS = 4000
 _ITEM_FRAME_WORDS = 3
 
 
+# Hard cap on the report (GR_STOP_HARD_CAP, on by default whenever
+# GR_STOP_TOTAL_TOKENS is set). The stopping rule above decides when research
+# stops; the hard cap then makes the report fit in what is left, so the query's
+# TokenTracker total cannot end above the target: the writer context is trimmed
+# (keeping the ranked selection) until its prompt fits, and the report's
+# max_tokens is set to the remainder. Prompt tokens are counted with o200k_base,
+# GPT-6.1 Sol's tokenizer: on 248 Sol DeepResearchGym reports the billed prompt
+# was that count plus 433-448 tokens (template, system prompt, query), and the
+# completion was at most 6.9k tokens.
+ENV_STOP_HARD_CAP = "GR_STOP_HARD_CAP"
+REPORT_ENCODING = "o200k_base"
+# Prompt tokens outside the context: template + system prompt, plus the query
+# (counted twice, it can appear in the template more than once). Observed 433-448.
+REPORT_PROMPT_FIXED_TOKENS = 600
+# Output kept for the report when the context is trimmed (observed max 6.9k).
+REPORT_MIN_OUTPUT_TOKENS = 8000
+# Tokens per word when tiktoken is unavailable (observed max 1.90 on Sol).
+REPORT_FALLBACK_TOKENS_PER_WORD = 2.0
+
+
+def _count_tokens(text: str) -> int:
+    try:
+        import tiktoken
+
+        return len(tiktoken.get_encoding(REPORT_ENCODING).encode(text, disallowed_special=()))
+    except Exception:
+        return int(REPORT_FALLBACK_TOKENS_PER_WORD * len(text.split())) + 1
+
+
+def _context_text(items: List[Any]) -> str:
+    """The writer context exactly as DeepResearchSkill.run hands it over."""
+    return "\n".join(
+        item if isinstance(item, str)
+        else item.get("Content", str(item)) if isinstance(item, dict)
+        else str(item)
+        for item in items
+    )
+
+
 def report_tokens_for_words(words: int) -> int:
     """Expected report cost (prompt + completion) for a writer context of ``words``."""
     return int(REPORT_TOKENS_PER_WORD * max(0, words)) + REPORT_PROMPT_OVERHEAD_TOKENS + REPORT_OUTPUT_TOKENS
@@ -550,6 +589,61 @@ class DeepResearchSkill:
                 flush=True,
             )
         return True
+
+    def _hard_cap_on(self) -> bool:
+        raw = os.environ.get(ENV_STOP_HARD_CAP, "").strip().lower()
+        return self.stop_total_tokens is not None and raw not in ("0", "false", "no", "off")
+
+    def _fit_report_to_budget(self, final_context: List[Any], build) -> List[Any]:
+        """Trim the writer context so that the report fits in the tokens left
+        under GR_STOP_TOTAL_TOKENS, and cap the report's output to the rest.
+
+        ``build(max_words)`` rebuilds the context under a word cap the same way
+        it was built (ranked selection or recency trim), so trimming keeps the
+        policy's ranking. Records the outcome in ``token_stop_info``."""
+        info = self.token_stop_info
+        used = _tokens_used()
+        remaining = self.stop_total_tokens - used
+        fixed = REPORT_PROMPT_FIXED_TOKENS + 2 * _count_tokens(str(self.researcher.query))
+        ctx_budget = remaining - fixed - REPORT_MIN_OUTPUT_TOKENS
+        text = _context_text(final_context)
+        ctx_tokens = _count_tokens(text)
+        words_before = len(text.split())
+        trimmed = ctx_tokens > ctx_budget
+        if trimmed:
+            words = words_before
+            for _ in range(12):
+                if ctx_budget <= 0:
+                    final_context, text, ctx_tokens = [], "", 0
+                    break
+                # Shrink in proportion to the overshoot, a little extra each time.
+                words = max(0, int(words * ctx_budget / max(ctx_tokens, 1) * 0.97))
+                final_context = build(words)
+                text = _context_text(final_context)
+                ctx_tokens = _count_tokens(text)
+                if ctx_tokens <= ctx_budget:
+                    break
+        max_output = remaining - fixed - ctx_tokens
+        cfg = self.researcher.cfg
+        limit = int(getattr(cfg, "smart_token_limit", 0) or 0)
+        new_limit = max(1, min(limit, max_output) if limit else max_output)
+        cfg.smart_token_limit = new_limit
+        info.update(
+            hard_cap=True,
+            report_budget_tokens=remaining,
+            report_context_tokens=ctx_tokens,
+            report_context_words=len(text.split()),
+            report_context_words_before_cap=words_before,
+            report_context_trimmed=trimmed,
+            report_max_output_tokens=new_limit,
+            # False only when research alone left too little for any report.
+            hard_cap_feasible=max_output >= REPORT_MIN_OUTPUT_TOKENS,
+        )
+        logger.info(
+            f"Token hard cap: {used} used, {remaining} left for the report; context "
+            f"{ctx_tokens} tokens ({'trimmed' if trimmed else 'untouched'}), max_tokens={new_limit}"
+        )
+        return final_context
 
     async def _orchestrator_llm_call(self, messages: List[Dict[str, str]]) -> str:
         """LLM call used by the prompted / learned policies; metered like every
@@ -1276,29 +1370,34 @@ Return ONLY a JSON object using this exact schema:
         if self.orchestrator is not None and final_mode == "ranked":
             share_raw = os.environ.get(ENV_FINAL_LEARNINGS_SHARE, "").strip()
             cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
-            final_context, final_stats = build_final_context(
-                context_with_citations,
-                list(self.trajectory_logger.get_retained_evidence().values()),
-                query_embedding=self.query_embedding,
-                subquestion_embeddings=self.subq_embeddings,
-                learnings_share=float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE,
-                item_max_words=int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS,
-            )
-            logger.info(f"Final context: {final_stats}")
+            retained = list(self.trajectory_logger.get_retained_evidence().values())
+
+            def build(max_words: int = MAX_CONTEXT_WORDS) -> List[Any]:
+                ctx, stats = build_final_context(
+                    context_with_citations,
+                    retained,
+                    query_embedding=self.query_embedding,
+                    subquestion_embeddings=self.subq_embeddings,
+                    max_words=max_words,
+                    learnings_share=float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE,
+                    item_max_words=int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS,
+                )
+                logger.info(f"Final context: {stats}")
+                return ctx
         else:
             if self.orchestrator is not None:
                 results['context'] = self._retained_context()
             if results.get('context'):
                 context_with_citations.extend(results['context'])
-            final_context = trim_context_to_word_limit(context_with_citations)
+
+            def build(max_words: int = MAX_CONTEXT_WORDS) -> List[Any]:
+                return trim_context_to_word_limit(context_with_citations, max_words)
+        final_context = build()
+        if self._hard_cap_on():
+            final_context = self._fit_report_to_budget(final_context, build)
 
         # Set enhanced context and visited URLs
-        self.researcher.context = "\n".join(
-            item if isinstance(item, str)
-            else item.get("Content", str(item)) if isinstance(item, dict)
-            else str(item)
-            for item in final_context
-        )
+        self.researcher.context = _context_text(final_context)
         self.researcher.visited_urls = results['visited_urls']
 
         # Set research sources
