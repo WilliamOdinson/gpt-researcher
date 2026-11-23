@@ -295,7 +295,7 @@ async def create_chat_completion(
             _input_tokens = usage_meta.get("input_tokens", 0) or usage_meta.get("prompt_tokens", 0) or 0
             _output_tokens = usage_meta.get("output_tokens", 0) or usage_meta.get("completion_tokens", 0) or 0
         TokenTracker.track_tokens(model, _input_tokens, _output_tokens, llm_costs, usage_tag=usage_tag)
-        LatencyTracker.track_latency("llm", time.time() - _llm_start, source=model)
+        LatencyTracker.track_latency("llm", time.time() - _llm_start, source=model, start=_llm_start)
         meta = provider.last_response_metadata
         call.update(
             input_tokens=int(_input_tokens),

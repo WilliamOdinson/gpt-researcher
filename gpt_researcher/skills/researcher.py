@@ -854,7 +854,9 @@ class ResearchConductor:
                         retriever.search, max_results=_max_results
                     )
                     latency = time.time() - start_time
-                    LatencyTracker.track_latency("search", latency, source=retriever_class.__name__)
+                    LatencyTracker.track_latency(
+                        "search", latency, source=retriever_class.__name__, start=start_time
+                    )
                     if search_results:
                         _global_search_cache.put(query, retriever_class.__name__, search_results, _max_results)
 
