@@ -91,6 +91,7 @@ from .policies import (  # noqa: F401
     OrchestrationPolicy,
     PoolItem,
     PromptedPolicy,
+    PromptedScoresPolicy,
     TopKPolicy,
     allocate_breadth,
     build_policy,

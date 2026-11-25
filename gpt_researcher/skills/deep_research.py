@@ -324,6 +324,56 @@ REPORT_MIN_OUTPUT_TOKENS = 8000
 REPORT_FALLBACK_TOKENS_PER_WORD = 2.0
 
 
+# Research-only budget (GR_RESEARCH_BUDGET). Unlike GR_STOP_TOTAL_TOKENS, it
+# counts research only: every LLM call before the report, except the writer
+# (usage tag ``report_generation``) and, when the orchestrator is served
+# locally (GR_ORCH_LLM_BASE_URL set, e.g. the PILOT adapter), the orchestrator.
+# Spend is input + GR_BUDGET_OUTPUT_WEIGHT * output tokens (default weight 1).
+# Research stops as soon as the spend reaches the budget: unfinished sub-queries
+# are cancelled, the round's checkpoint still runs on the finished ones, and
+# the report is then written with no budget limit. With GR_BUDGET_FORCE_FULL
+# (on by default in this mode) a policy's TERMINATE is recorded but ignored,
+# so every method spends the same research budget. Unset / 0 = off.
+ENV_RESEARCH_BUDGET = "GR_RESEARCH_BUDGET"
+ENV_BUDGET_OUTPUT_WEIGHT = "GR_BUDGET_OUTPUT_WEIGHT"
+ENV_BUDGET_FORCE_FULL = "GR_BUDGET_FORCE_FULL"
+ENV_ORCH_LLM_BASE_URL = "GR_ORCH_LLM_BASE_URL"
+WRITER_USAGE_TAGS = ("report_generation",)
+ORCHESTRATOR_USAGE_TAG = "orchestrator"
+# How often a running round checks the research budget.
+RESEARCH_BUDGET_POLL_S = 0.25
+
+# Writer-context word cap (GR_MAX_CONTEXT_WORDS); MAX_CONTEXT_WORDS when unset.
+ENV_MAX_CONTEXT_WORDS = "GR_MAX_CONTEXT_WORDS"
+
+
+def _max_context_words() -> int:
+    raw = os.environ.get(ENV_MAX_CONTEXT_WORDS, "").strip()
+    return int(raw) if raw and int(raw) > 0 else MAX_CONTEXT_WORDS
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def research_spend(
+    per_usage: Dict[str, Dict[str, Any]],
+    output_weight: float = 1.0,
+    exclude_tags: Set[str] | frozenset = frozenset(WRITER_USAGE_TAGS),
+) -> float:
+    """Research budget spend from TokenTracker.per_usage_totals: input plus
+    weighted output tokens over every usage tag except ``exclude_tags``."""
+    total = 0.0
+    for tag, row in per_usage.items():
+        if tag in exclude_tags:
+            continue
+        total += int(row.get("input", 0) or 0) + output_weight * int(row.get("output", 0) or 0)
+    return total
+
+
 def _count_tokens(text: str) -> int:
     try:
         import tiktoken
@@ -506,12 +556,92 @@ class DeepResearchSkill:
             "skipped_subqueries": 0,
             "skipped_rounds": 0,
         }
+        # Research-only budget (GR_RESEARCH_BUDGET); see research_spend.
+        raw_rb = os.environ.get(ENV_RESEARCH_BUDGET, "").strip()
+        self.research_budget: int | None = int(raw_rb) if raw_rb and int(raw_rb) > 0 else None
+        raw_w = os.environ.get(ENV_BUDGET_OUTPUT_WEIGHT, "").strip()
+        self.budget_output_weight = float(raw_w) if raw_w else 1.0
+        self.budget_force_full = self.research_budget is not None and _env_flag(ENV_BUDGET_FORCE_FULL, True)
+        exclude = set(WRITER_USAGE_TAGS)
+        self.orchestrator_is_local = bool(os.environ.get(ENV_ORCH_LLM_BASE_URL, "").strip())
+        if self.orchestrator_is_local:
+            exclude.add(ORCHESTRATOR_USAGE_TAG)
+        self.budget_exclude_tags = frozenset(exclude)
+        self.research_budget_info: Dict[str, Any] = {
+            "research_budget": self.research_budget,
+            "output_weight": self.budget_output_weight,
+            "force_full": self.budget_force_full,
+            "excluded_usage_tags": sorted(self.budget_exclude_tags),
+            "exhausted": False,
+            "exhausted_at_round": None,
+            "spend_at_exhaustion": None,
+            "cancelled_subqueries": 0,
+            "terminate_ignored": 0,
+            "research_spend": None,
+        }
         logger.info(
             f"DeepResearchSkill initialized: depth={self.depth}, breadth={self.breadth}, "
             f"orchestrator={self.policy_name}, context_budget={self.token_budget}, "
             f"stop_total_tokens={self.stop_total_tokens}, "
-            f"report_reserve={self.token_stop_info['report_reserve']}"
+            f"report_reserve={self.token_stop_info['report_reserve']}, "
+            f"research_budget={self.research_budget} (output weight {self.budget_output_weight}, "
+            f"force_full={self.budget_force_full}, excluded={sorted(self.budget_exclude_tags)}), "
+            f"max_context_words={_max_context_words()}"
         )
+
+    def _research_spend(self) -> float:
+        return research_spend(
+            TokenTracker.get_per_usage_totals(), self.budget_output_weight, self.budget_exclude_tags
+        )
+
+    def _research_budget_exhausted(self) -> bool:
+        """True once research spend has reached GR_RESEARCH_BUDGET. The first
+        time, records where and stops every pending recursion."""
+        if self.research_budget is None:
+            return False
+        info = self.research_budget_info
+        if info["exhausted"]:
+            return True
+        spend = self._research_spend()
+        if spend < self.research_budget:
+            return False
+        info.update(
+            exhausted=True,
+            exhausted_at_round=self.trajectory_logger.trajectory.rounds[-1].round_id + 1
+            if self.trajectory_logger.trajectory.rounds else 1,
+            spend_at_exhaustion=spend,
+        )
+        self.stop_requested = True
+        logger.info(f"Research budget reached: spend={spend:.0f} >= {self.research_budget}; stopping research.")
+        print(f"\nRESEARCH BUDGET: {spend:.0f} >= {self.research_budget}; stopping research.", flush=True)
+        return True
+
+    async def _gather_within_budget(self, coros: List[Any]) -> List[Any]:
+        """asyncio.gather that, under GR_RESEARCH_BUDGET, cancels the
+        unfinished coroutines as soon as the budget is reached. Cancelled
+        entries come back as None."""
+        if self.research_budget is None:
+            return list(await asyncio.gather(*coros))
+        tasks = [asyncio.ensure_future(c) for c in coros]
+        pending = set(tasks)
+        while pending:
+            _, pending = await asyncio.wait(pending, timeout=RESEARCH_BUDGET_POLL_S)
+            if pending and self._research_budget_exhausted():
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                self.research_budget_info["cancelled_subqueries"] += len(pending)
+                break
+        out: List[Any] = []
+        for t in tasks:
+            if t.cancelled():
+                out.append(None)
+                continue
+            exc = t.exception()
+            if exc is not None:
+                raise exc
+            out.append(t.result())
+        return out
 
     def _writer_context_words(self) -> int:
         """Words the final writer context would hold if research stopped now.
@@ -523,18 +653,18 @@ class DeepResearchSkill:
         estimate is the full word cap."""
         final_mode = os.environ.get(ENV_FINAL_CONTEXT, "").strip().lower() or "ranked"
         if self.orchestrator is None or final_mode != "ranked":
-            return MAX_CONTEXT_WORDS
+            return _max_context_words()
         share_raw = os.environ.get(ENV_FINAL_LEARNINGS_SHARE, "").strip()
         share = float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE
         cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
         item_max = int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS
-        learn_cap = int(MAX_CONTEXT_WORDS * max(0.0, min(1.0, share)))
+        learn_cap = int(_max_context_words() * max(0.0, min(1.0, share)))
         learn_words = min(learn_cap, sum(count_words(l) for l in self._learnings_seen))
         ev_words = 0
         for e in self.trajectory_logger.get_retained_evidence().values():
             w = len(str(e.content).split())
             ev_words += (min(w, item_max) if item_max else w) + _ITEM_FRAME_WORDS
-        return min(MAX_CONTEXT_WORDS, learn_words + ev_words)
+        return min(_max_context_words(), learn_words + ev_words)
 
     def _report_reserve(self) -> tuple[int, int | None]:
         """Tokens to hold back for the report if one more sub-query runs, and
@@ -543,7 +673,7 @@ class DeepResearchSkill:
             return self.report_reserve_fixed, None
         growth = max(self._subquery_context_words, default=DEFAULT_SUBQUERY_CONTEXT_WORDS)
         projected = min(
-            MAX_CONTEXT_WORDS,
+            _max_context_words(),
             int(self._writer_context_words() + growth * (self._pending_subqueries + 1)),
         )
         return report_tokens_for_words(projected), projected
@@ -882,7 +1012,7 @@ Return ONLY a JSON object using this exact schema:
         all_context = []
         all_sources = []
 
-        if self.stop_requested or self._token_stop_blocks("round"):
+        if self.stop_requested or self._research_budget_exhausted() or self._token_stop_blocks("round"):
             return {
                 'learnings': all_learnings,
                 'visited_urls': all_visited_urls,
@@ -916,7 +1046,7 @@ Return ONLY a JSON object using this exact schema:
 
         async def process_query(serp_query: Dict[str, str]) -> Optional[Dict[str, Any]]:
             async with semaphore:
-                if self._token_stop_blocks("subquery"):
+                if self._research_budget_exhausted() or self._token_stop_blocks("subquery"):
                     return None
                 subquery_start = _tokens_used()
                 try:
@@ -984,7 +1114,7 @@ Return ONLY a JSON object using this exact schema:
 
         # Process queries concurrently with limit
         tasks = [process_query(query) for query in serp_queries]
-        results = await asyncio.gather(*tasks)
+        results = await self._gather_within_budget(tasks)
         results = [r for r in results if r is not None]
 
         # Update breadth progress based on successful queries
@@ -1182,6 +1312,8 @@ Return ONLY a JSON object using this exact schema:
                 tokens_used=int(tokens_now.get("input_tokens", 0)) + int(tokens_now.get("output_tokens", 0)),
                 token_budget=self.token_budget,
                 subquestion_embeddings=[list(v) for v in self.subq_embeddings],
+                research_budget=self.research_budget,
+                research_spend=self._research_spend() if self.research_budget is not None else None,
             )
             decision = await self.orchestrator.decide(inp)
 
@@ -1199,7 +1331,13 @@ Return ONLY a JSON object using this exact schema:
                 if it.item_id in decision.kept_ids
             ]
 
-            # u: stop every pending recursion once any round says terminate.
+            # u: stop every pending recursion once any round says terminate,
+            # unless GR_BUDGET_FORCE_FULL makes every method spend the full
+            # research budget; the policy's choice is then only recorded.
+            if decision.terminate and self.budget_force_full:
+                decision.meta["terminate_ignored"] = True
+                self.research_budget_info["terminate_ignored"] += 1
+                decision.terminate = False
             if decision.terminate:
                 self.stop_requested = True
             decision_type = "terminate" if decision.terminate else "continue"
@@ -1342,6 +1480,9 @@ Return ONLY a JSON object using this exact schema:
             on_progress=on_progress
         )
 
+        # Research spend under GR_RESEARCH_BUDGET's rules, before any writing.
+        self.research_budget_info["research_spend"] = self._research_spend()
+
         # Get costs after deep research
         research_costs = self.researcher.get_costs() - initial_costs
 
@@ -1372,7 +1513,8 @@ Return ONLY a JSON object using this exact schema:
             cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
             retained = list(self.trajectory_logger.get_retained_evidence().values())
 
-            def build(max_words: int = MAX_CONTEXT_WORDS) -> List[Any]:
+            def build(max_words: int | None = None) -> List[Any]:
+                max_words = max_words or _max_context_words()
                 ctx, stats = build_final_context(
                     context_with_citations,
                     retained,
@@ -1390,8 +1532,8 @@ Return ONLY a JSON object using this exact schema:
             if results.get('context'):
                 context_with_citations.extend(results['context'])
 
-            def build(max_words: int = MAX_CONTEXT_WORDS) -> List[Any]:
-                return trim_context_to_word_limit(context_with_citations, max_words)
+            def build(max_words: int | None = None) -> List[Any]:
+                return trim_context_to_word_limit(context_with_citations, max_words or _max_context_words())
         final_context = build()
         if self._hard_cap_on():
             final_context = self._fit_report_to_budget(final_context, build)

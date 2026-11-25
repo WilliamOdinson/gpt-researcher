@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from ..config.config import Config
 from ..utils.llm import create_chat_completion
 from ..utils.logger import get_formatted_logger
-from ..prompts import PromptFamily, get_prompt_by_report_type
+from ..prompts import PromptFamily, get_prompt_by_report_type, report_body_words, report_word_target
 from ..utils.enum import ReportType, Tone
 
 logger = get_formatted_logger()
@@ -368,5 +368,38 @@ Place each image on its own line after the relevant section header or paragraph.
             )
         except Exception as e:
             print(f"Error in generate_report: {e}")
+
+    # GR_REPORT_WORDS: one rewrite when the report misses the target range.
+    target = report_word_target() if not use_short_answer else None
+    if target and report:
+        words = report_body_words(report)
+        if not (target[1] <= words <= target[2]):
+            logger.info(f"Report has {words} words, outside {target[1]}-{target[2]}; asking for a rewrite.")
+            try:
+                rewrite = await create_chat_completion(
+                    model=cfg.smart_llm_model,
+                    messages=messages + [
+                        {"role": "assistant", "content": report},
+                        {"role": "user", "content": (
+                            f"Your report has {words} words before the reference list. Rewrite it to "
+                            f"between {target[1]} and {target[2]} words (about {target[0]}), not counting "
+                            "the reference list. Keep the same structure, citations and reference list."
+                        )},
+                    ],
+                    temperature=temperature,
+                    llm_provider=cfg.smart_llm_provider,
+                    stream=True,
+                    websocket=websocket,
+                    max_tokens=max_tokens,
+                    llm_kwargs=cfg.llm_kwargs,
+                    cost_callback=cost_callback,
+                    usage_tag="report_generation",
+                    **kwargs
+                )
+                if rewrite:
+                    report = rewrite
+                    logger.info(f"Rewritten report has {report_body_words(report)} words.")
+            except Exception as e:
+                logger.warning(f"Report length rewrite failed; keeping the first report: {e}")
 
     return report

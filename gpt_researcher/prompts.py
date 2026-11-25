@@ -7,6 +7,35 @@ from .config import Config
 from .utils.enum import ReportSource, ReportType, Tone
 from .utils.enum import PromptFamily as PromptFamilyEnum
 from typing import Callable, List, Dict, Any
+import os
+import re
+
+# Fixed report length (GR_REPORT_WORDS): when set, the deep-research writer is
+# asked for that many words (+/- GR_REPORT_WORDS_TOL, default 0.10), not
+# counting the reference list, instead of a minimum. Same target for every
+# method, so judge length bias cannot favour one of them.
+ENV_REPORT_WORDS = "GR_REPORT_WORDS"
+ENV_REPORT_WORDS_TOL = "GR_REPORT_WORDS_TOL"
+_REFERENCES_HEADING = re.compile(r"^\s*#{1,6}\s*(references|sources|bibliography|works cited)\b", re.I | re.M)
+
+
+def report_word_target() -> tuple[int, int, int] | None:
+    """(target, low, high) words from GR_REPORT_WORDS, or None when unset."""
+    raw = os.environ.get(ENV_REPORT_WORDS, "").strip()
+    if not raw or int(raw) <= 0:
+        return None
+    target = int(raw)
+    tol_raw = os.environ.get(ENV_REPORT_WORDS_TOL, "").strip()
+    tol = float(tol_raw) if tol_raw else 0.10
+    return target, int(round(target * (1 - tol))), int(round(target * (1 + tol)))
+
+
+def report_body_words(report: str) -> int:
+    """Words in a report before its reference list."""
+    m = _REFERENCES_HEADING.search(report or "")
+    body = report[: m.start()] if m else (report or "")
+    return len(body.split())
+
 
 
 # Verbatim from texttron/BrowseComp-Plus search_agent/prompts.py. Default
@@ -484,6 +513,12 @@ eg: Author, A. A. (Year, Month Date). Title of web page. Website Name. [url webs
 You MUST write all used source document names at the end of the report as references, and make sure to not add duplicated sources, but only one reference for each."
 """
 
+        _target = report_word_target()
+        length_rule = (
+            f"Be about {_target[0]} words long, between {_target[1]} and {_target[2]} words, "
+            "not counting the reference list"
+            if _target else f"Have a minimum length of {total_words} words"
+        )
         tone_prompt = f"Write the report in a {tone.value} tone." if tone else ""
 
         return f"""
@@ -499,7 +534,7 @@ The report should:
 3. Present a coherent narrative that builds from foundational to advanced insights
 4. Maintain proper citation of sources throughout
 5. Be well-structured with clear sections and subsections
-6. Have a minimum length of {total_words} words
+6. {length_rule}
 7. Follow {report_format} format with markdown syntax
 8. Use markdown tables, lists and other formatting features when presenting comparative data, statistics, or structured information
 

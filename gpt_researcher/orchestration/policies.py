@@ -36,6 +36,7 @@ POLICY_NAMES = (
     "extractive",
     "llmlingua",
     "prompted",
+    "prompted_scores",
     "greedy",
     "heuristic_stop",
     "random",
@@ -66,6 +67,10 @@ ENV_STOP_GAIN_THRESHOLD = "GR_STOP_GAIN_THRESHOLD"
 ENV_STOP_MIN_ROUNDS = "GR_STOP_MIN_ROUNDS"
 ENV_STOP_PATIENCE = "GR_STOP_PATIENCE"
 ENV_STOP_RETAIN = "GR_STOP_RETAIN"
+# PromptedScoresPolicy: keep items scored >= GR_PROMPTED_KEEP_THRESHOLD and
+# terminate when the continue score is < GR_PROMPTED_STOP_THRESHOLD (0-10).
+ENV_PROMPTED_KEEP_THRESHOLD = "GR_PROMPTED_KEEP_THRESHOLD"
+ENV_PROMPTED_STOP_THRESHOLD = "GR_PROMPTED_STOP_THRESHOLD"
 
 _DEFAULT_LLMLINGUA_MODEL = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
 
@@ -142,6 +147,9 @@ class OrchestrationInput:
     token_budget: int | None
     # e(q^(k)) for each entry of ``subquestions``; empty when unavailable.
     subquestion_embeddings: list[list[float]] = field(default_factory=list)
+    # GR_RESEARCH_BUDGET and the research spend so far (None when off).
+    research_budget: int | None = None
+    research_spend: float | None = None
 
     @property
     def pool(self) -> list[PoolItem]:
@@ -485,6 +493,12 @@ class PromptedPolicy(OrchestrationPolicy):
             f"Tokens spent so far: {inp.tokens_used}. "
             + (f"Context budget for retained evidence: {budget} tokens." if budget else "No hard context budget.")
         )
+        if inp.research_budget:
+            spent = int(inp.research_spend or 0)
+            lines.append(
+                f"Research budget: {inp.research_budget} tokens in total; spent {spent}; "
+                f"remaining {max(0, inp.research_budget - spent)}. Research stops when it runs out."
+            )
         lines.append("")
         lines.append("Evidence pool (id | sim-to-question | tokens | depth | round | status | snippet):")
         for it in inp.pool:
@@ -501,13 +515,16 @@ class PromptedPolicy(OrchestrationPolicy):
         else:
             lines.append("Open branches: none")
         lines.append("")
-        lines.append(
+        lines.append(self.response_format())
+        return "\n".join(lines)
+
+    def response_format(self) -> str:
+        return (
             "Respond with exactly three lines:\n"
             "KEEP: <space-separated evidence ids to keep, or ALL>\n"
             "ALLOC: <node_id>=<weight> <node_id>=<weight> ... (weights are relative)\n"
             "DECISION: CONTINUE or TERMINATE"
         )
-        return "\n".join(lines)
 
     def parse(self, text: str, inp: OrchestrationInput) -> OrchestrationDecision:
         # Shared with the BC data builder and the learned policy so the
@@ -545,6 +562,87 @@ class PromptedPolicy(OrchestrationPolicy):
         dec = self.parse(text, inp)
         dec.meta["prompt_chars"] = len(prompt)
         return dec
+
+
+class PromptedScoresPolicy(PromptedPolicy):
+    """Prompted orchestration with scores and thresholds, as in FlashResearch:
+    the LLM sees the same state as ``prompted`` but scores every evidence item
+    and every open branch from 0 to 10 and rates the value of researching
+    further; fixed thresholds turn the scores into the decision.
+
+      keep item     score >= GR_PROMPTED_KEEP_THRESHOLD (default 6)
+      allocation    branch scores, normalized (all zero -> uniform)
+      terminate     continue score < GR_PROMPTED_STOP_THRESHOLD (default 3)
+
+    An item or branch without a score is kept / weighted as if scored 10, and
+    a missing CONTINUE line means continue, matching ``prompted``'s fallbacks.
+    Thresholds must be chosen on development queries, not evaluation queries."""
+
+    name = "prompted_scores"
+
+    SYSTEM = (
+        "You are the orchestrator of a deep research agent. After each research "
+        "round you score (1) how useful each evidence item is for the final report, "
+        "(2) how promising each open research branch is for further search, and "
+        "(3) how much value further research would add. "
+        "Answer ONLY in the exact three-line format requested."
+    )
+
+    def __init__(self, llm_call: LLMCall, budget: int | None = None) -> None:
+        super().__init__(llm_call, budget)
+        self.keep_threshold = _env_float(ENV_PROMPTED_KEEP_THRESHOLD, 6.0)
+        self.stop_threshold = _env_float(ENV_PROMPTED_STOP_THRESHOLD, 3.0)
+
+    def response_format(self) -> str:
+        return (
+            "Respond with exactly three lines, using integer scores from 0 (useless) to 10 (essential):\n"
+            "SCORES: <evidence_id>=<score> <evidence_id>=<score> ... (one score for every evidence item)\n"
+            "BRANCHES: <node_id>=<score> <node_id>=<score> ... (one score for every open branch)\n"
+            "CONTINUE: <score for the value of researching further>"
+        )
+
+    @staticmethod
+    def _scores(line: str | None) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key, val in re.findall(r"([A-Za-z0-9_\-:.]+)\s*=\s*(-?\d+(?:\.\d+)?)", line or ""):
+            out[key] = max(0.0, min(10.0, float(val)))
+        return out
+
+    def parse(self, text: str, inp: OrchestrationInput) -> OrchestrationDecision:
+        def field_line(name: str) -> str | None:
+            m = re.search(rf"^\s*{name}\s*:\s*(.*)$", text or "", re.M | re.I)
+            return m.group(1).strip() if m else None
+
+        pool_ids = [it.item_id for it in inp.pool]
+        node_ids = [f.node_id for f in inp.frontier]
+        item_scores = self._scores(field_line("SCORES"))
+        branch_scores = self._scores(field_line("BRANCHES"))
+        cont_raw = field_line("CONTINUE")
+        cont_m = re.search(r"-?\d+(?:\.\d+)?", cont_raw or "")
+        cont = max(0.0, min(10.0, float(cont_m.group(0)))) if cont_m else None
+
+        scores = {i: item_scores.get(i, 10.0) for i in pool_ids}
+        kept = {i for i, s in scores.items() if s >= self.keep_threshold}
+        weights = {n: branch_scores.get(n, 10.0) for n in node_ids}
+        alloc = (
+            {n: w / sum(weights.values()) for n, w in weights.items()}
+            if weights and sum(weights.values()) > 0 else uniform_allocation(inp.frontier)
+        )
+        return OrchestrationDecision(
+            terminate=cont is not None and cont < self.stop_threshold,
+            kept_ids=kept,
+            branch_allocation=alloc,
+            meta={
+                "item_scores": scores,
+                "branch_scores": weights,
+                "continue_score": cont,
+                "keep_threshold": self.keep_threshold,
+                "stop_threshold": self.stop_threshold,
+                "missing_item_scores": sum(1 for i in pool_ids if i not in item_scores),
+                "missing_branch_scores": sum(1 for n in node_ids if n not in branch_scores),
+                "parse_failure": not item_scores,
+            },
+        )
 
 
 # --------------------------------------------------------------------------
@@ -601,6 +699,10 @@ def build_policy(
         if llm_call is None:
             raise ValueError("prompted policy needs an llm_call")
         return PromptedPolicy(llm_call=llm_call, budget=budget)
+    if name == "prompted_scores":
+        if llm_call is None:
+            raise ValueError("prompted_scores policy needs an llm_call")
+        return PromptedScoresPolicy(llm_call=llm_call, budget=budget)
     if name == "greedy":
         from .coverage import GreedyMarginalUtilityPolicy
 
