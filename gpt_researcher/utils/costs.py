@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 # specific patterns (e.g. "-mini") must come before their base model.
 # Prices as of July 2026: https://openai.com/api/pricing/
 OPENAI_MODEL_PRICING = (
+    # GPT-6.1 Sol at Azure Flex rates (half of Global Standard's $2 / $10),
+    # the tier our runs use; from public price lists, Nov 2026.
+    (("gpt-6.1-sol",), 1.0, 5.0),
     (("gpt-5.5-pro",), 30.0, 180.0),
     (("gpt-5.5",), 5.0, 30.0),
     (("gpt-5.4-pro",), 30.0, 180.0),
