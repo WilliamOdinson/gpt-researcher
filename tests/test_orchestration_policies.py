@@ -245,6 +245,69 @@ async def test_prompted_parse_failure_falls_back_to_keep_all():
     assert dec.terminate is False
 
 
+async def test_prompted_scores_off_by_default():
+    seen: list[list[dict]] = []
+
+    async def llm(messages):
+        seen.append(messages)
+        return "KEEP: P1\nALLOC: nA=1\nDECISION: CONTINUE\nSCORE: P1=9"
+
+    dec = await PromptedPolicy(llm).decide(_inp(POOL_NEW, POOL_PREV))
+    assert "SCORE" not in seen[0][1]["content"]
+    assert dec.item_scores == {}
+    assert "item_scores" not in dec.meta
+
+
+async def test_prompted_scores_every_item():
+    seen: list[list[dict]] = []
+
+    async def llm(messages):
+        seen.append(messages)
+        return (
+            "KEEP: P1 P2 R1\nALLOC: nA=2 nB=1 nC=1\nDECISION: CONTINUE\n"
+            "SCORE: P1=9 P2=7.5 P3=2\nP4=0 R1=8 ZZ=5 P1=1"  # wraps; unknown id; repeat
+        )
+
+    dec = await PromptedPolicy(llm, scores=True).decide(_inp(POOL_NEW, POOL_PREV))
+    prompt = seen[0][1]["content"]
+    assert "exactly four lines" in prompt and "SCORE: <id>=<0-10>" in prompt
+    assert dec.item_scores == {"P1": 9.0, "P2": 7.5, "P3": 2.0, "P4": 0.0, "R1": 8.0}
+    assert dec.meta["item_scores"] == dec.item_scores
+    assert dec.meta["scores_missing"] == 0
+    # KEEP still decides what is kept; the scores do not change it.
+    assert dec.kept_ids == {"P1", "P2", "R1"}
+    assert dec.meta["parse_failure"] is False
+
+
+async def test_prompted_scores_clamped_missing_and_any_position():
+    async def llm(messages):
+        return "SCORE: P1=14 P2=-3 R1: 6\nKEEP: ALL\nALLOC: nA=1\nDECISION: TERMINATE"
+
+    dec = await PromptedPolicy(llm, scores=True).decide(_inp(POOL_NEW, POOL_PREV))
+    assert dec.item_scores == {"P1": 10.0, "P2": 0.0, "R1": 6.0}
+    assert dec.meta["scores_missing"] == 2  # P3, P4 not rated
+    assert dec.terminate is True and dec.kept_ids == {"P1", "P2", "P3", "P4", "R1"}
+
+
+async def test_prompted_scores_absent_line():
+    async def llm(messages):
+        return "KEEP: P1\nALLOC: nA=1\nDECISION: CONTINUE"
+
+    dec = await PromptedPolicy(llm, scores=True).decide(_inp(POOL_NEW, POOL_PREV))
+    assert dec.item_scores == {}
+    assert dec.meta["scores_missing"] == 5
+
+
+def test_prompted_scores_from_env(monkeypatch):
+    async def llm(messages):
+        return ""
+
+    monkeypatch.delenv("GR_PROMPTED_SCORES", raising=False)
+    assert build_policy("prompted", llm_call=llm).scores is False
+    monkeypatch.setenv("GR_PROMPTED_SCORES", "1")
+    assert build_policy("prompted", llm_call=llm).scores is True
+
+
 async def test_prompted_llm_error_does_not_crash():
     async def llm(messages):
         raise RuntimeError("api down")

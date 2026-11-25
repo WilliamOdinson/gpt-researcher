@@ -81,6 +81,7 @@ from .policies import (  # noqa: F401
     ENV_STOP_RETAIN as ENV_STOP_RETAIN_NAME,
     ENV_SEED as ENV_SEED_NAME,
     ENV_POLICY as ENV_POLICY_NAME,
+    ENV_PROMPTED_SCORES as ENV_PROMPTED_SCORES_NAME,
     POLICY_NAMES,
     ExtractivePolicy,
     FrontierInfo,
@@ -95,5 +96,7 @@ from .policies import (  # noqa: F401
     allocate_breadth,
     build_policy,
     estimate_tokens,
+    parse_scores,
     policy_name_from_env,
+    prompted_scores_from_env,
 )

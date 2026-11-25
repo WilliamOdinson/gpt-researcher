@@ -66,6 +66,11 @@ ENV_STOP_GAIN_THRESHOLD = "GR_STOP_GAIN_THRESHOLD"
 ENV_STOP_MIN_ROUNDS = "GR_STOP_MIN_ROUNDS"
 ENV_STOP_PATIENCE = "GR_STOP_PATIENCE"
 ENV_STOP_RETAIN = "GR_STOP_RETAIN"
+# PromptedPolicy: GR_PROMPTED_SCORES=1 adds a fourth answer line, SCORE, with a
+# 0-10 usefulness rating for every evidence item. KEEP still decides what is
+# kept; the ratings are returned in ``item_scores`` and logged with the round.
+ENV_PROMPTED_SCORES = "GR_PROMPTED_SCORES"
+SCORE_MIN, SCORE_MAX = 0.0, 10.0
 
 _DEFAULT_LLMLINGUA_MODEL = "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
 
@@ -155,6 +160,9 @@ class OrchestrationDecision:
     branch_allocation: dict[str, float]              # w  (node_id -> weight)
     rewritten: dict[str, str] = field(default_factory=dict)  # item_id -> new text
     meta: dict[str, Any] = field(default_factory=dict)
+    # Per-item usefulness rating from policies that produce one (prompted with
+    # GR_PROMPTED_SCORES=1); empty otherwise.
+    item_scores: dict[str, float] = field(default_factory=dict)
 
     def text_for(self, item: PoolItem) -> str:
         return self.rewritten.get(item.item_id, item.text)
@@ -452,6 +460,34 @@ class LLMLinguaPolicy(OrchestrationPolicy):
 LLMCall = Callable[[list[dict[str, str]]], Awaitable[str]]
 
 
+_SCORE_RE = re.compile(r"^\s*SCORE\s*:", re.IGNORECASE | re.MULTILINE)
+_OTHER_LINE_RE = re.compile(r"^\s*(KEEP|ALLOC|DECISION)\s*:", re.IGNORECASE)
+_SCORE_PAIR_RE = re.compile(r"([A-Za-z0-9_\-]+)\s*[=:]\s*(-?[0-9]*\.?[0-9]+)")
+
+
+def parse_scores(text: str, pool_ids: list[str]) -> dict[str, float]:
+    """``SCORE: id=7 id=3 ...`` -> {id: rating}, clamped to 0-10.
+
+    The SCORE line may wrap over several lines; it runs to the end of the
+    answer, skipping any KEEP / ALLOC / DECISION line after it. Unknown ids are
+    dropped and the first rating of an id wins; items the model did not rate
+    are left out (the caller records how many as ``scores_missing``)."""
+    m = _SCORE_RE.search(text or "")
+    if not m:
+        return {}
+    body = "\n".join(ln for ln in text[m.end():].splitlines() if not _OTHER_LINE_RE.match(ln))
+    pool = set(pool_ids)
+    out: dict[str, float] = {}
+    for iid, val in _SCORE_PAIR_RE.findall(body):
+        if iid in pool and iid not in out:
+            out[iid] = min(SCORE_MAX, max(SCORE_MIN, float(val)))
+    return out
+
+
+def prompted_scores_from_env() -> bool:
+    return os.environ.get(ENV_PROMPTED_SCORES, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 class PromptedPolicy(OrchestrationPolicy):
     """Row 5. One LLM call per round sees the raw pool (ids, similarity,
     tokens, depth, age, a 200-char snippet), the open frontier, and the
@@ -469,9 +505,10 @@ class PromptedPolicy(OrchestrationPolicy):
         "Answer ONLY in the exact three-line format requested."
     )
 
-    def __init__(self, llm_call: LLMCall, budget: int | None = None) -> None:
+    def __init__(self, llm_call: LLMCall, budget: int | None = None, scores: bool = False) -> None:
         self.llm_call = llm_call
         self.budget = budget
+        self.scores = scores
 
     def build_prompt(self, inp: OrchestrationInput) -> str:
         budget = self.budget if self.budget is not None else inp.token_budget
@@ -502,10 +539,15 @@ class PromptedPolicy(OrchestrationPolicy):
             lines.append("Open branches: none")
         lines.append("")
         lines.append(
-            "Respond with exactly three lines:\n"
+            f"Respond with exactly {'four' if self.scores else 'three'} lines:\n"
             "KEEP: <space-separated evidence ids to keep, or ALL>\n"
             "ALLOC: <node_id>=<weight> <node_id>=<weight> ... (weights are relative)\n"
             "DECISION: CONTINUE or TERMINATE"
+            + (
+                "\nSCORE: <id>=<0-10> for EVERY evidence item above, kept or not "
+                "(how useful it is for the final report; 10 = essential, 0 = useless)"
+                if self.scores else ""
+            )
         )
         return "\n".join(lines)
 
@@ -517,12 +559,19 @@ class PromptedPolicy(OrchestrationPolicy):
         parsed = parse_action(
             text, [it.item_id for it in inp.pool], [f.node_id for f in inp.frontier]
         )
-        return OrchestrationDecision(
+        dec = OrchestrationDecision(
             terminate=parsed.terminate,
             kept_ids=parsed.kept_ids,
             branch_allocation=parsed.branch_allocation,
             meta=parsed.meta,
         )
+        if self.scores:
+            scores = parse_scores(text, [it.item_id for it in inp.pool])
+            dec.item_scores = scores
+            # meta is logged with the round, so the ratings land in the trajectory.
+            dec.meta["item_scores"] = scores
+            dec.meta["scores_missing"] = len(inp.pool) - len(scores)
+        return dec
 
     async def decide(self, inp: OrchestrationInput) -> OrchestrationDecision:
         prompt = self.build_prompt(inp)
@@ -600,7 +649,7 @@ def build_policy(
     if name == "prompted":
         if llm_call is None:
             raise ValueError("prompted policy needs an llm_call")
-        return PromptedPolicy(llm_call=llm_call, budget=budget)
+        return PromptedPolicy(llm_call=llm_call, budget=budget, scores=prompted_scores_from_env())
     if name == "greedy":
         from .coverage import GreedyMarginalUtilityPolicy
 

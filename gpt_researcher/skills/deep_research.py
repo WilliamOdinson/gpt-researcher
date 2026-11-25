@@ -32,6 +32,7 @@ from ..orchestration import (
     build_policy,
     estimate_tokens,
     policy_name_from_env,
+    prompted_scores_from_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -674,7 +675,9 @@ class DeepResearchSkill:
             llm_provider=provider,
             model=model,
             temperature=0.0,
-            max_tokens=2000,
+            # The SCORE line rates every pool item (~5 tokens each), which can
+            # outgrow the 2000 tokens the three-line answer needs.
+            max_tokens=6000 if prompted_scores_from_env() else 2000,
             llm_kwargs=llm_kwargs,
             usage_tag="orchestrator",
         )
