@@ -332,7 +332,7 @@ REPORT_FALLBACK_TOKENS_PER_WORD = 2.0
 # Research stops as soon as the spend reaches the budget: unfinished sub-queries
 # are cancelled, the round's checkpoint still runs on the finished ones, and
 # the report is then written with no budget limit. With GR_BUDGET_FORCE_FULL
-# (on by default in this mode) a policy's TERMINATE is recorded but ignored,
+# (off by default; set it to 1 for the equal-spend runs) a policy's TERMINATE is recorded but ignored,
 # so every method spends the same research budget. Unset / 0 = off.
 ENV_RESEARCH_BUDGET = "GR_RESEARCH_BUDGET"
 ENV_BUDGET_OUTPUT_WEIGHT = "GR_BUDGET_OUTPUT_WEIGHT"
@@ -343,13 +343,39 @@ ORCHESTRATOR_USAGE_TAG = "orchestrator"
 # How often a running round checks the research budget.
 RESEARCH_BUDGET_POLL_S = 0.25
 
-# Writer-context word cap (GR_MAX_CONTEXT_WORDS); MAX_CONTEXT_WORDS when unset.
+# Writer-context word cap (GR_MAX_CONTEXT_WORDS). Unset: MAX_CONTEXT_WORDS
+# (25,000, as before). 0 / none / off: no cap, so the writer gets everything
+# research kept; per-page cuts are then off too unless GR_FINAL_ITEM_MAX_WORDS
+# is set. GR_WRITER_MAX_INPUT_TOKENS (optional) makes the run fail before the
+# report if the uncapped context would not fit the writer model, instead of
+# the provider truncating or rejecting it silently.
 ENV_MAX_CONTEXT_WORDS = "GR_MAX_CONTEXT_WORDS"
+ENV_WRITER_MAX_INPUT_TOKENS = "GR_WRITER_MAX_INPUT_TOKENS"
+NO_WORD_CAP = 10**12
+_NO_CAP_VALUES = ("0", "none", "off", "no", "unlimited")
 
 
 def _max_context_words() -> int:
-    raw = os.environ.get(ENV_MAX_CONTEXT_WORDS, "").strip()
-    return int(raw) if raw and int(raw) > 0 else MAX_CONTEXT_WORDS
+    raw = os.environ.get(ENV_MAX_CONTEXT_WORDS, "").strip().lower()
+    if not raw:
+        return MAX_CONTEXT_WORDS
+    if raw in _NO_CAP_VALUES:
+        return NO_WORD_CAP
+    val = int(raw)
+    return val if val > 0 else NO_WORD_CAP
+
+
+def _writer_cap_off() -> bool:
+    return _max_context_words() >= NO_WORD_CAP
+
+
+def _item_max_words() -> int:
+    """Per-page word cut for the writer context (0 = none). Defaults to
+    DEFAULT_ITEM_MAX_WORDS, or to no cut when the writer cap is off."""
+    raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
+    if raw:
+        return int(raw)
+    return 0 if _writer_cap_off() else DEFAULT_ITEM_MAX_WORDS
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -436,8 +462,10 @@ def build_final_context(
     learn_cap = int(max_words * max(0.0, min(1.0, learnings_share)))
     learn_out: List[str] = []
     learn_words = 0
+    learn_words_in = 0
     for line in learnings:
         w = count_words(line)
+        learn_words_in += w
         if learn_words + w > learn_cap:
             continue
         learn_out.append(line)
@@ -465,13 +493,21 @@ def build_final_context(
 
     remaining = max_words - learn_words
     picked: List[tuple[int, str]] = []
+    evidence_words_in = 0
+    cut_by_item_cap = 0
+    cut_by_window = 0
+    items_cut = 0
     for idx, e in order:
         words = str(e.content).split()
+        evidence_words_in += len(words)
         if item_max_words and len(words) > item_max_words:
+            cut_by_item_cap += len(words) - item_max_words
+            items_cut += 1
             words = words[:item_max_words]
         text = DeepResearchSkill._format_item(e.source_url, " ".join(words))
         w = count_words(text)
         if w > remaining:
+            cut_by_window += len(words)
             continue
         picked.append((idx, text))
         remaining -= w
@@ -485,6 +521,15 @@ def build_final_context(
         "evidence_in": len(evidence),
         "evidence_used": len(picked),
         "words": max_words - remaining,
+        # Where collected words were lost (all 0 means the writer saw everything).
+        "words_collected": learn_words_in + evidence_words_in,
+        "learnings_words_cut_by_share": learn_words_in - learn_words,
+        "evidence_words_cut_by_item_cap": cut_by_item_cap,
+        "evidence_items_cut_by_item_cap": items_cut,
+        "evidence_words_cut_by_window": cut_by_window,
+        "evidence_items_dropped_by_window": len(order) - len(picked),
+        "word_cap": None if max_words >= NO_WORD_CAP else max_words,
+        "item_max_words": item_max_words or None,
     }
     return context, stats
 
@@ -561,12 +606,14 @@ class DeepResearchSkill:
         self.research_budget: int | None = int(raw_rb) if raw_rb and int(raw_rb) > 0 else None
         raw_w = os.environ.get(ENV_BUDGET_OUTPUT_WEIGHT, "").strip()
         self.budget_output_weight = float(raw_w) if raw_w else 1.0
-        self.budget_force_full = self.research_budget is not None and _env_flag(ENV_BUDGET_FORCE_FULL, True)
+        self.budget_force_full = self.research_budget is not None and _env_flag(ENV_BUDGET_FORCE_FULL, False)
         exclude = set(WRITER_USAGE_TAGS)
         self.orchestrator_is_local = bool(os.environ.get(ENV_ORCH_LLM_BASE_URL, "").strip())
         if self.orchestrator_is_local:
             exclude.add(ORCHESTRATOR_USAGE_TAG)
         self.budget_exclude_tags = frozenset(exclude)
+        # What reached the writer and where collected words were cut.
+        self.writer_context_info: Dict[str, Any] = {}
         self.research_budget_info: Dict[str, Any] = {
             "research_budget": self.research_budget,
             "output_weight": self.budget_output_weight,
@@ -656,8 +703,7 @@ class DeepResearchSkill:
             return _max_context_words()
         share_raw = os.environ.get(ENV_FINAL_LEARNINGS_SHARE, "").strip()
         share = float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE
-        cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
-        item_max = int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS
+        item_max = _item_max_words()
         learn_cap = int(_max_context_words() * max(0.0, min(1.0, share)))
         learn_words = min(learn_cap, sum(count_words(l) for l in self._learnings_seen))
         ev_words = 0
@@ -719,6 +765,29 @@ class DeepResearchSkill:
                 flush=True,
             )
         return True
+
+    def _record_writer_context(self, final_context: List[Any], stats: Dict[str, Any]) -> None:
+        """Record what reached the writer (``writer_context_info``) and, under
+        GR_WRITER_MAX_INPUT_TOKENS, fail before writing if it cannot fit."""
+        text = _context_text(final_context)
+        tokens = _count_tokens(text)
+        info = dict(stats)
+        info.update(
+            word_cap=None if _writer_cap_off() else _max_context_words(),
+            context_words=len(text.split()),
+            context_tokens=tokens,
+            hard_cap_trimmed=bool(self.token_stop_info.get("report_context_trimmed")),
+        )
+        raw = os.environ.get(ENV_WRITER_MAX_INPUT_TOKENS, "").strip()
+        limit = int(raw) if raw else None
+        info["writer_max_input_tokens"] = limit
+        self.writer_context_info = info
+        logger.info(f"Writer context: {info}")
+        if limit and tokens > limit:
+            raise RuntimeError(
+                f"Writer context is {tokens} tokens, above {ENV_WRITER_MAX_INPUT_TOKENS}={limit}; "
+                "refusing to write a report from a context the model would truncate."
+            )
 
     def _hard_cap_on(self) -> bool:
         raw = os.environ.get(ENV_STOP_HARD_CAP, "").strip().lower()
@@ -1508,9 +1577,9 @@ Return ONLY a JSON object using this exact schema:
         final_mode = os.environ.get(ENV_FINAL_CONTEXT, "").strip().lower() or "ranked"
         if final_mode not in FINAL_CONTEXT_MODES:
             raise ValueError(f"{ENV_FINAL_CONTEXT}={final_mode!r} is not one of {FINAL_CONTEXT_MODES}")
+        last_stats: Dict[str, Any] = {}
         if self.orchestrator is not None and final_mode == "ranked":
             share_raw = os.environ.get(ENV_FINAL_LEARNINGS_SHARE, "").strip()
-            cap_raw = os.environ.get(ENV_FINAL_ITEM_MAX_WORDS, "").strip()
             retained = list(self.trajectory_logger.get_retained_evidence().values())
 
             def build(max_words: int | None = None) -> List[Any]:
@@ -1522,9 +1591,11 @@ Return ONLY a JSON object using this exact schema:
                     subquestion_embeddings=self.subq_embeddings,
                     max_words=max_words,
                     learnings_share=float(share_raw) if share_raw else DEFAULT_LEARNINGS_SHARE,
-                    item_max_words=int(cap_raw) if cap_raw else DEFAULT_ITEM_MAX_WORDS,
+                    item_max_words=_item_max_words(),
                 )
                 logger.info(f"Final context: {stats}")
+                last_stats.clear()
+                last_stats.update(stats)
                 return ctx
         else:
             if self.orchestrator is not None:
@@ -1533,10 +1604,23 @@ Return ONLY a JSON object using this exact schema:
                 context_with_citations.extend(results['context'])
 
             def build(max_words: int | None = None) -> List[Any]:
-                return trim_context_to_word_limit(context_with_citations, max_words or _max_context_words())
+                ctx = trim_context_to_word_limit(context_with_citations, max_words or _max_context_words())
+                words_in = sum(count_words(c) for c in context_with_citations)
+                words_out = sum(count_words(c) for c in ctx)
+                last_stats.clear()
+                last_stats.update(
+                    mode="recency",
+                    items_in=len(context_with_citations),
+                    items_used=len(ctx),
+                    words_collected=words_in,
+                    words_used=words_out,
+                    words_cut_by_window=max(0, words_in - words_out),
+                )
+                return ctx
         final_context = build()
         if self._hard_cap_on():
             final_context = self._fit_report_to_budget(final_context, build)
+        self._record_writer_context(final_context, last_stats)
 
         # Set enhanced context and visited URLs
         self.researcher.context = _context_text(final_context)

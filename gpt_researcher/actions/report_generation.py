@@ -9,6 +9,15 @@ from ..utils.enum import ReportType, Tone
 
 logger = get_formatted_logger()
 
+# Outcome of the GR_REPORT_WORDS length target for the last report written:
+# target range, words in the first draft, whether it was rewritten, final words.
+REPORT_LENGTH_LOG: dict = {}
+ENV_REPORT_REWRITE = "GR_REPORT_REWRITE"
+
+
+def _report_rewrite_on() -> bool:
+    return os.environ.get(ENV_REPORT_REWRITE, "").strip().lower() in ("1", "true", "yes", "on")
+
 # Synthesis for BrowseComp / BrowseComp-Plus: official QUERY_TEMPLATE_NO_GET_DOCUMENT
 # as the last user message (openai_client.py default), not a 2000-word report.
 # Selected by write_report(answer_format="browsecomp"), GR_ANSWER_FORMAT, or
@@ -369,11 +378,21 @@ Place each image on its own line after the relevant section header or paragraph.
         except Exception as e:
             print(f"Error in generate_report: {e}")
 
-    # GR_REPORT_WORDS: one rewrite when the report misses the target range.
+    # GR_REPORT_WORDS: the length target is in the prompt. A rewrite when the
+    # report misses the range is opt-in (GR_REPORT_REWRITE=1): it is a second
+    # writing pass for only the reports that miss, so it can differ by method.
+    # REPORT_LENGTH_LOG records the outcome either way.
     target = report_word_target() if not use_short_answer else None
+    REPORT_LENGTH_LOG.clear()
     if target and report:
         words = report_body_words(report)
-        if not (target[1] <= words <= target[2]):
+        in_range = target[1] <= words <= target[2]
+        REPORT_LENGTH_LOG.update(
+            target_words=target[0], low=target[1], high=target[2],
+            words_first=words, in_range_first=in_range,
+            rewrite_enabled=_report_rewrite_on(), rewritten=False, words_final=words,
+        )
+        if not in_range and _report_rewrite_on():
             logger.info(f"Report has {words} words, outside {target[1]}-{target[2]}; asking for a rewrite.")
             try:
                 rewrite = await create_chat_completion(
@@ -398,6 +417,7 @@ Place each image on its own line after the relevant section header or paragraph.
                 )
                 if rewrite:
                     report = rewrite
+                    REPORT_LENGTH_LOG.update(rewritten=True, words_final=report_body_words(report))
                     logger.info(f"Rewritten report has {report_body_words(report)} words.")
             except Exception as e:
                 logger.warning(f"Report length rewrite failed; keeping the first report: {e}")
