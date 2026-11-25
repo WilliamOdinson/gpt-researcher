@@ -528,7 +528,6 @@ def build_final_context(
         "evidence_items_cut_by_item_cap": items_cut,
         "evidence_words_cut_by_window": cut_by_window,
         "evidence_items_dropped_by_window": len(order) - len(picked),
-        "word_cap": None if max_words >= NO_WORD_CAP else max_words,
         "item_max_words": item_max_words or None,
     }
     return context, stats
@@ -856,10 +855,10 @@ class DeepResearchSkill:
         """
         model = os.environ.get("GR_ORCH_LLM_MODEL", "").strip() or self.researcher.cfg.strategic_llm_model
         provider = os.environ.get("GR_ORCH_LLM_PROVIDER", "").strip() or (
-            "openai" if os.environ.get("GR_ORCH_LLM_BASE_URL", "").strip() else self.researcher.cfg.strategic_llm_provider
+            "openai" if os.environ.get(ENV_ORCH_LLM_BASE_URL, "").strip() else self.researcher.cfg.strategic_llm_provider
         )
         llm_kwargs: Dict[str, Any] = dict(self.researcher.cfg.llm_kwargs or {})
-        base_url = os.environ.get("GR_ORCH_LLM_BASE_URL", "").strip()
+        base_url = os.environ.get(ENV_ORCH_LLM_BASE_URL, "").strip()
         if base_url:
             # Set both names: langchain-openai accepts either; the OpenAI SDK
             # reads `base_url`. create_chat_completion must not overwrite these

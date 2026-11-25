@@ -51,7 +51,6 @@ def test_uncapped_context_keeps_every_word():
     assert stats["evidence_words_cut_by_item_cap"] == 0
     assert stats["evidence_words_cut_by_window"] == 0
     assert stats["learnings_words_cut_by_share"] == 0
-    assert stats["word_cap"] is None
     assert stats["words_collected"] == 120_000 + 20_000
 
 
@@ -62,7 +61,6 @@ def test_capped_context_reports_where_words_were_cut():
     assert stats["evidence_words_cut_by_item_cap"] == 20 * 1500
     assert stats["evidence_items_dropped_by_window"] > 0
     assert stats["evidence_words_cut_by_window"] > 0
-    assert stats["word_cap"] == 25_000
 
 
 def _recorder(monkeypatch, limit=None):
