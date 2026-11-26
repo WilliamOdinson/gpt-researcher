@@ -1422,6 +1422,11 @@ Return ONLY a JSON object using this exact schema:
                 estimate_tokens(decision.text_for(it)) for it in inp.pool if it.item_id in decision.kept_ids
             )
             decision_meta["child_breadth"] = child_breadth
+            # Research budget and spend at this checkpoint, so BC data can rebuild
+            # the state with GR_LEARNED_BUDGET_IN_STATE.
+            if inp.research_budget is not None:
+                decision_meta["research_budget"] = inp.research_budget
+                decision_meta["research_spend"] = inp.research_spend
 
         tokens_after = TokenTracker.snapshot()
         latency_counts_after = LatencyTracker.snapshot()

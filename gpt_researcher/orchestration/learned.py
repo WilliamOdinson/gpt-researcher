@@ -23,6 +23,8 @@ see ``GR_ORCH_LLM_*`` there.
 
 from __future__ import annotations
 
+import os
+
 import logging
 from typing import Any
 
@@ -54,6 +56,13 @@ def _rows(items: list[PoolItem]) -> list[ItemRow]:
         )
         for it in items
     ]
+
+
+ENV_BUDGET_IN_STATE = "GR_LEARNED_BUDGET_IN_STATE"
+
+
+def budget_in_state() -> bool:
+    return os.environ.get(ENV_BUDGET_IN_STATE, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class LearnedPolicy(OrchestrationPolicy):
@@ -118,6 +127,11 @@ class LearnedPolicy(OrchestrationPolicy):
         )
         if self.snippet_chars is not None:
             kwargs["snippet_chars"] = self.snippet_chars
+        # GR_LEARNED_BUDGET_IN_STATE=1: show the research budget and spend, for a
+        # policy trained with them (bc_pairs with the same variable). Off by
+        # default: the current adapters were trained without that line.
+        if budget_in_state() and inp.research_budget:
+            kwargs.update(research_budget=inp.research_budget, research_spend=inp.research_spend)
         prompt = serialize_state(**kwargs)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
