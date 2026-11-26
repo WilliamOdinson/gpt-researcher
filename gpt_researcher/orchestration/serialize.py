@@ -77,6 +77,8 @@ def serialize_state(
     frontier: Sequence[StateFrontier],
     feature_names: Sequence[str],
     snippet_chars: int = DEFAULT_SNIPPET_CHARS,
+    research_budget: int | None = None,
+    research_spend: float | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"Root question: {root_query.strip()}")
@@ -88,6 +90,11 @@ def serialize_state(
         f"Round {int(round_id)} | depth {int(tree_depth)} | tokens used {int(tokens_used)} "
         f"| context budget {budget_txt} | open branches {len(frontier)}"
     )
+    # Research budget line only when given (GR_LEARNED_BUDGET_IN_STATE), so prompts
+    # of policies trained without it stay byte-identical.
+    if research_budget:
+        spent = int(research_spend or 0)
+        lines.append(f"Research budget {int(research_budget)} | spent {spent} | remaining {max(0, int(research_budget) - spent)}")
     lines.append("")
     lines.append(f"Evidence (id | {' '.join(feature_names)} | status | source | snippet):")
     # Canonical order (retained first, then by id) so a prompt rebuilt from a
